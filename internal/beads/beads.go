@@ -282,9 +282,7 @@ func (b *Beads) run(args ...string) (_ []byte, retErr error) {
 	defer func() {
 		telemetry.RecordBDCall(context.Background(), args, float64(time.Since(start).Milliseconds()), retErr, stdout.Bytes(), stderr.String())
 	}()
-	// Use --allow-stale to prevent failures when db is temporarily stale
-	// (e.g., after daemon is killed during shutdown).
-	fullArgs := append([]string{"--allow-stale"}, args...)
+	fullArgs := args
 
 	// Always explicitly set BEADS_DIR to prevent inherited env vars from
 	// causing prefix mismatches. Use explicit beadsDir if set, otherwise
@@ -329,7 +327,7 @@ func (b *Beads) runWithRouting(args ...string) (_ []byte, retErr error) { //noli
 	defer func() {
 		telemetry.RecordBDCall(context.Background(), args, float64(time.Since(start).Milliseconds()), retErr, stdout.Bytes(), stderr.String())
 	}()
-	fullArgs := append([]string{"--allow-stale"}, args...)
+	fullArgs := args
 
 	cmd := exec.Command("bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Dir = b.workDir
@@ -506,37 +504,32 @@ func stripEnvPrefixes(environ []string, prefixes ...string) []string {
 }
 
 // List returns issues matching the given options.
+// Uses `bd query --json` for JSON-compatible output (bd list --json is not
+// supported in bd 0.59.x; bd query produces a JSON array).
 func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
-	args := []string{"list", "--json"}
+	// Build query string for bd query command.
+	// bd query produces JSON array output, unlike bd list --json which doesn't.
+	var clauses []string
 
-	if opts.Status != "" {
-		args = append(args, "--status="+opts.Status)
-	}
-	// Prefer Label over Type (Type is deprecated)
-	if opts.Label != "" {
-		args = append(args, "--label="+opts.Label)
-	} else if opts.Type != "" {
-		// Deprecated: convert type to label for backward compatibility
-		args = append(args, "--label=gt:"+opts.Type)
-	}
-	if opts.Priority >= 0 {
-		args = append(args, fmt.Sprintf("--priority=%d", opts.Priority))
-	}
-	if opts.Parent != "" {
-		args = append(args, "--parent="+opts.Parent)
+	if opts.Status != "" && opts.Status != "all" {
+		clauses = append(clauses, fmt.Sprintf("status=%s", opts.Status))
 	}
 	if opts.Assignee != "" {
-		args = append(args, "--assignee="+opts.Assignee)
+		// Quote assignee value to handle slashes (e.g., "monorepo/refinery").
+		clauses = append(clauses, fmt.Sprintf(`assignee="%s"`, opts.Assignee))
 	}
-	if opts.NoAssignee {
-		args = append(args, "--no-assignee")
+	if opts.Priority >= 0 {
+		clauses = append(clauses, fmt.Sprintf("priority=%d", opts.Priority))
 	}
-	if opts.Limit > 0 {
-		args = append(args, fmt.Sprintf("--limit=%d", opts.Limit))
+
+	var query string
+	if len(clauses) > 0 {
+		query = strings.Join(clauses, " AND ")
 	} else {
-		// Override bd's default limit of 50 to avoid silent truncation
-		args = append(args, "--limit=0")
+		query = "status=open OR status=in_progress OR status=blocked OR status=hooked OR status=closed OR status=deferred"
 	}
+
+	args := []string{"query", query, "--json"}
 
 	out, err := b.run(args...)
 	if err != nil {
@@ -546,6 +539,56 @@ func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
 	var issues []*Issue
 	if err := json.Unmarshal(out, &issues); err != nil {
 		return nil, fmt.Errorf("parsing bd list output: %w", err)
+	}
+
+	// Apply post-filters not supported by bd query syntax.
+	// Label and Type filtering done in-memory.
+	if opts.Label != "" {
+		label := opts.Label
+		filtered := issues[:0]
+		for _, issue := range issues {
+			for _, l := range issue.Labels {
+				if l == label {
+					filtered = append(filtered, issue)
+					break
+				}
+			}
+		}
+		issues = filtered
+	} else if opts.Type != "" {
+		filtered := issues[:0]
+		for _, issue := range issues {
+			if issue.Type == opts.Type {
+				filtered = append(filtered, issue)
+			}
+		}
+		issues = filtered
+	}
+
+	if opts.NoAssignee {
+		filtered := issues[:0]
+		for _, issue := range issues {
+			if issue.Assignee == "" {
+				filtered = append(filtered, issue)
+			}
+		}
+		issues = filtered
+	}
+
+	if opts.Parent != "" {
+		filtered := issues[:0]
+		for _, issue := range issues {
+			if issue.Parent == opts.Parent {
+				filtered = append(filtered, issue)
+			}
+		}
+		issues = filtered
+	}
+
+	// Apply limit.
+	limit := opts.Limit
+	if limit > 0 && len(issues) > limit {
+		issues = issues[:limit]
 	}
 
 	return issues, nil
