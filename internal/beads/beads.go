@@ -27,105 +27,6 @@ var (
 	ErrFlagTitle    = errors.New("title looks like a CLI flag (starts with '-'); use --title=\"...\" to set flag-like titles intentionally")
 )
 
-// bdAllowStale caches whether the installed bd supports --allow-stale.
-// The cache is keyed by the resolved bd path so tests and subprocess stubs that
-// replace bd on PATH get re-probed instead of reusing stale capability state.
-var (
-	bdAllowStaleMu     sync.Mutex
-	bdAllowStalePath   string
-	bdAllowStaleResult bool
-)
-
-// ResetBdAllowStaleCacheForTest clears the cached bd --allow-stale capability.
-// It exists for tests that swap bd binaries on PATH within a single process.
-func ResetBdAllowStaleCacheForTest() {
-	bdAllowStaleMu.Lock()
-	bdAllowStalePath = ""
-	bdAllowStaleResult = false
-	bdAllowStaleMu.Unlock()
-}
-
-// BdSupportsAllowStale returns true if the installed bd binary accepts --allow-stale.
-func BdSupportsAllowStale() bool {
-	return BdSupportsAllowStaleWithEnv(nil)
-}
-
-// BdSupportsAllowStaleWithEnv returns true if the installed bd binary accepts
-// --allow-stale, probing with the provided environment when supplied.
-func BdSupportsAllowStaleWithEnv(env []string) bool {
-	bdPath, err := exec.LookPath("bd")
-	if err != nil {
-		return false
-	}
-
-	bdAllowStaleMu.Lock()
-	cachedPath := bdAllowStalePath
-	cachedResult := bdAllowStaleResult
-	bdAllowStaleMu.Unlock()
-
-	if cachedPath == bdPath {
-		return cachedResult
-	}
-
-	cmd := exec.Command(bdPath, "--allow-stale", "version") //nolint:gosec // G204: bd is a trusted internal tool
-	if env != nil {
-		cmd.Env = env
-	}
-	supported := cmd.Run() == nil
-
-	bdAllowStaleMu.Lock()
-	if bdAllowStalePath != bdPath {
-		bdAllowStalePath = bdPath
-		bdAllowStaleResult = supported
-	}
-	result := bdAllowStaleResult
-	bdAllowStaleMu.Unlock()
-	return result
-}
-
-// MaybePrependAllowStale prepends --allow-stale to args if bd supports it.
-// Exported for use by other packages that shell out to bd directly.
-func MaybePrependAllowStale(args []string) []string {
-	if BdSupportsAllowStale() {
-		return append([]string{"--allow-stale"}, args...)
-	}
-	return args
-}
-
-// MaybePrependAllowStaleWithEnv prepends --allow-stale to args if bd supports it,
-// probing with the provided environment when supplied.
-func MaybePrependAllowStaleWithEnv(env []string, args []string) []string {
-	if BdSupportsAllowStaleWithEnv(env) {
-		return append([]string{"--allow-stale"}, args...)
-	}
-	return args
-}
-
-// InjectFlatForListJSON adds --flat to bd list commands that use --json.
-// bd v0.59+ tree-format output ignores --json; --flat is required for JSON.
-// Exported for use by other packages that call bd list directly.
-func InjectFlatForListJSON(args []string) []string {
-	// Only apply to top-level "bd list" commands (args[0] == "list"),
-	// not subcommands like "bd dep list" where --flat is unsupported.
-	if len(args) == 0 || args[0] != "list" {
-		return args
-	}
-	hasJSON := false
-	hasFlat := false
-	for _, a := range args[1:] {
-		switch {
-		case a == "--json":
-			hasJSON = true
-		case a == "--flat":
-			hasFlat = true
-		}
-	}
-	if hasJSON && !hasFlat {
-		return append(args, "--flat")
-	}
-	return args
-}
-
 // ExtractIssueID strips the external:prefix:id wrapper from bead IDs.
 // bd dep add wraps cross-rig IDs as "external:prefix:id" for routing,
 // but consumers need the raw bead ID for display and lookups.
@@ -233,22 +134,6 @@ func IsAgentBead(issue *Issue) bool {
 	return HasLabel(issue, "gt:agent")
 }
 
-// IsProtectedBead checks if a bead has any protection labels that should
-// prevent automated status changes (AutoClose, unassign on polecat removal, etc.).
-// Protected labels: gt:standing-orders, gt:keep, gt:role, gt:rig.
-func IsProtectedBead(issue *Issue) bool {
-	if issue == nil {
-		return false
-	}
-	for _, l := range issue.Labels {
-		switch l {
-		case "gt:standing-orders", "gt:keep", "gt:role", "gt:rig":
-			return true
-		}
-	}
-	return false
-}
-
 // IssueDep represents a dependency or dependent issue with its relation.
 type IssueDep struct {
 	ID             string `json:"id"`
@@ -269,14 +154,12 @@ type ListOptions struct {
 	Assignee   string // filter by assignee (e.g., "gastown/Toast")
 	NoAssignee bool   // filter for issues with no assignee
 	Limit      int    // Max results (0 = unlimited, overrides bd default of 50)
-	Ephemeral  bool   // Search wisps table (ephemeral issues) instead of issues table
 }
 
 // CreateOptions specifies options for creating an issue.
 type CreateOptions struct {
 	Title       string
 	Type        string   // Deprecated: use Labels instead. Was "task", "bug", "feature", "epic".
-	Label       string   // Deprecated: use Labels instead. Backward-compatible single-label form.
 	Labels      []string // Labels to set (e.g., "gt:task", "gt:merge-request")
 	Priority    int      // 0-4
 	Description string
@@ -295,6 +178,14 @@ type UpdateOptions struct {
 	AddLabels    []string // Labels to add
 	RemoveLabels []string // Labels to remove
 	SetLabels    []string // Labels to set (replaces all existing)
+}
+
+// SyncStatus represents the sync status of the beads repository.
+type SyncStatus struct {
+	Branch    string
+	Ahead     int
+	Behind    int
+	Conflicts []string
 }
 
 // Beads wraps bd CLI operations for a working directory.
@@ -391,56 +282,26 @@ func (b *Beads) run(args ...string) (_ []byte, retErr error) {
 	defer func() {
 		telemetry.RecordBDCall(context.Background(), args, float64(time.Since(start).Milliseconds()), retErr, stdout.Bytes(), stderr.String())
 	}()
-	// bd v0.59+ requires --flat for --json to produce JSON output on "list" commands.
-	// Without --flat, bd list --json silently returns human-readable tree format,
-	// causing all JSON parsing to fail. Inject --flat before --allow-stale prepend
-	// (which changes args[0] from "list" to "--allow-stale").
-	args = InjectFlatForListJSON(args)
-
-	// Conditionally use --allow-stale to prevent failures when db is temporarily stale
-	// (e.g., after daemon is killed during shutdown). Only if bd supports it.
-	beadsDir := b.beadsDir
-	if beadsDir == "" {
-		beadsDir = ResolveBeadsDir(b.workDir)
-	}
-	runEnv := append(b.buildRunEnv(), "BEADS_DIR="+beadsDir)
-	fullArgs := MaybePrependAllowStaleWithEnv(runEnv, args)
+	fullArgs := args
 
 	// Always explicitly set BEADS_DIR to prevent inherited env vars from
 	// causing prefix mismatches. Use explicit beadsDir if set, otherwise
 	// resolve from working directory.
+	beadsDir := b.beadsDir
+	if beadsDir == "" {
+		beadsDir = ResolveBeadsDir(b.workDir)
+	}
+
 	cmd := exec.Command("bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Dir = b.workDir
 
-	cmd.Env = runEnv
+	cmd.Env = append(b.buildRunEnv(), "BEADS_DIR="+beadsDir)
 	cmd.Env = append(cmd.Env, telemetry.OTELEnvForSubprocess()...)
 
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	err := cmd.Run()
-
-	// If bd doesn't support --flat, retry without it. The retry is done here
-	// (not in callers like List) so that InjectFlatForListJSON doesn't re-add
-	// --flat on the retry path.
-	if err != nil && strings.Contains(stderr.String(), "unknown flag: --flat") {
-		retryArgs := make([]string, 0, len(fullArgs))
-		for _, a := range fullArgs {
-			if a != "--flat" {
-				retryArgs = append(retryArgs, a)
-			}
-		}
-		stdout.Reset()
-		stderr.Reset()
-		cmd = exec.Command("bd", retryArgs...) //nolint:gosec // G204: bd is a trusted internal tool
-		cmd.Dir = b.workDir
-		cmd.Env = runEnv
-		cmd.Env = append(cmd.Env, telemetry.OTELEnvForSubprocess()...)
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-		err = cmd.Run()
-	}
-
 	if err != nil {
 		return nil, b.wrapError(err, stderr.String(), args)
 	}
@@ -452,7 +313,7 @@ func (b *Beads) run(args ...string) (_ []byte, retErr error) {
 		return nil, b.wrapError(fmt.Errorf("command produced no output"), stderr.String(), args)
 	}
 
-	return stripStdoutWarnings(stdout.Bytes()), nil
+	return stdout.Bytes(), nil
 }
 
 // runWithRouting executes a bd command without setting BEADS_DIR, allowing bd's
@@ -466,13 +327,12 @@ func (b *Beads) runWithRouting(args ...string) (_ []byte, retErr error) { //noli
 	defer func() {
 		telemetry.RecordBDCall(context.Background(), args, float64(time.Since(start).Milliseconds()), retErr, stdout.Bytes(), stderr.String())
 	}()
-	runEnv := b.buildRoutingEnv()
-	fullArgs := MaybePrependAllowStaleWithEnv(runEnv, args)
+	fullArgs := args
 
 	cmd := exec.Command("bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Dir = b.workDir
 
-	cmd.Env = runEnv
+	cmd.Env = b.buildRoutingEnv()
 	cmd.Env = append(cmd.Env, telemetry.OTELEnvForSubprocess()...)
 
 	cmd.Stdout = &stdout
@@ -487,7 +347,7 @@ func (b *Beads) runWithRouting(args ...string) (_ []byte, retErr error) { //noli
 		return nil, b.wrapError(fmt.Errorf("command produced no output"), stderr.String(), args)
 	}
 
-	return stripStdoutWarnings(stdout.Bytes()), nil
+	return stdout.Bytes(), nil
 }
 
 // Run executes a bd command and returns stdout.
@@ -655,54 +515,36 @@ func stripEnvPrefixes(environ []string, prefixes ...string) []string {
 }
 
 // List returns issues matching the given options.
-// When Ephemeral is true, uses "bd query" with ephemeral=true to search the
-// wisps table (where ephemeral issues live in beads v0.59+). Without this,
-// "bd list" only searches the issues table and misses wisps entirely.
+// Uses `bd query --json` for JSON-compatible output (bd list --json is not
+// supported in bd 0.59.x; bd query produces a JSON array).
 func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
-	if opts.Ephemeral {
-		return b.listEphemeral(opts)
-	}
+	// Build query string for bd query command.
+	// bd query produces JSON array output, unlike bd list --json which doesn't.
+	var clauses []string
 
-	args := []string{"list", "--json"}
-
-	if opts.Status != "" {
-		args = append(args, "--status="+opts.Status)
-	}
-	// Prefer Label over Type (Type is deprecated)
-	if opts.Label != "" {
-		args = append(args, "--label="+opts.Label)
-	} else if opts.Type != "" {
-		// Deprecated: convert type to label for backward compatibility
-		args = append(args, "--label=gt:"+opts.Type)
-	}
-	if opts.Priority >= 0 {
-		args = append(args, fmt.Sprintf("--priority=%d", opts.Priority))
-	}
-	if opts.Parent != "" {
-		args = append(args, "--parent="+opts.Parent)
+	if opts.Status != "" && opts.Status != "all" {
+		clauses = append(clauses, fmt.Sprintf("status=%s", opts.Status))
 	}
 	if opts.Assignee != "" {
-		args = append(args, "--assignee="+opts.Assignee)
+		// Quote assignee value to handle slashes (e.g., "monorepo/refinery").
+		clauses = append(clauses, fmt.Sprintf(`assignee="%s"`, opts.Assignee))
 	}
-	if opts.NoAssignee {
-		args = append(args, "--no-assignee")
+	if opts.Priority >= 0 {
+		clauses = append(clauses, fmt.Sprintf("priority=%d", opts.Priority))
 	}
-	if opts.Limit > 0 {
-		args = append(args, fmt.Sprintf("--limit=%d", opts.Limit))
+
+	var query string
+	if len(clauses) > 0 {
+		query = strings.Join(clauses, " AND ")
 	} else {
-		// Override bd's default limit of 50 to avoid silent truncation
-		args = append(args, "--limit=0")
+		query = "status=open OR status=in_progress OR status=blocked OR status=hooked OR status=closed OR status=deferred"
 	}
+
+	args := []string{"query", query, "--json"}
 
 	out, err := b.run(args...)
 	if err != nil {
 		return nil, err
-	}
-
-	// bd list --json may return plain text (e.g., "No issues found.") instead
-	// of an empty JSON array when there are no results. Handle gracefully.
-	if len(out) == 0 || !isJSONBytes(out) {
-		return nil, nil
 	}
 
 	var issues []*Issue
@@ -710,187 +552,57 @@ func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
 		return nil, fmt.Errorf("parsing bd list output: %w", err)
 	}
 
-	return issues, nil
-}
-
-// listEphemeral searches the wisps table using "bd query" with ephemeral=true.
-// This is necessary because "bd list" only searches the issues table and does
-// not support an --ephemeral flag. Wisps (ephemeral issues like merge-request
-// beads) live in a separate table since beads v0.59.
-func (b *Beads) listEphemeral(opts ListOptions) ([]*Issue, error) {
-	// Build query expression: ephemeral=true AND <filters>
-	clauses := []string{"ephemeral=true"}
-
+	// Apply post-filters not supported by bd query syntax.
+	// Label and Type filtering done in-memory.
 	if opts.Label != "" {
-		clauses = append(clauses, "label="+opts.Label)
-	} else if opts.Type != "" {
-		clauses = append(clauses, "label=gt:"+opts.Type)
-	}
-	if opts.Status != "" && opts.Status != "all" {
-		clauses = append(clauses, "status="+opts.Status)
-	}
-	if opts.Priority >= 0 {
-		clauses = append(clauses, fmt.Sprintf("priority=%d", opts.Priority))
-	}
-	if opts.Parent != "" {
-		clauses = append(clauses, "parent="+opts.Parent)
-	}
-	if opts.Assignee != "" {
-		clauses = append(clauses, "assignee="+opts.Assignee)
-	}
-
-	queryExpr := strings.Join(clauses, " AND ")
-	args := []string{"query", "--json", queryExpr}
-
-	if opts.Status == "all" {
-		args = append(args, "--all")
-	}
-	if opts.Limit > 0 {
-		args = append(args, fmt.Sprintf("--limit=%d", opts.Limit))
-	}
-
-	out, err := b.run(args...)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(out) == 0 || !isJSONBytes(out) {
-		return nil, nil
-	}
-
-	var issues []*Issue
-	if err := json.Unmarshal(out, &issues); err != nil {
-		return nil, fmt.Errorf("parsing bd query output: %w", err)
-	}
-
-	return issues, nil
-}
-
-// stripStdoutWarnings removes warning/diagnostic lines that bd may emit to stdout.
-// bd sometimes prints "warning: ..." lines to stdout instead of stderr, which
-// corrupts JSON output. This strips those lines so downstream JSON parsing works.
-func stripStdoutWarnings(data []byte) []byte {
-	if !bytes.Contains(data, []byte("warning:")) {
-		return data
-	}
-
-	lines := bytes.Split(data, []byte("\n"))
-	var cleaned [][]byte
-	stripped := false
-	for _, line := range lines {
-		if bytes.HasPrefix(bytes.TrimSpace(line), []byte("warning:")) {
-			stripped = true
-			continue
-		}
-		cleaned = append(cleaned, line)
-	}
-
-	if !stripped {
-		return data
-	}
-	return bytes.Join(cleaned, []byte("\n"))
-}
-
-// isJSONBytes returns true if the byte slice starts with [ or { (after whitespace).
-// bd list --json may return plain text like "No issues found." instead of JSON
-// when there are no results.
-func isJSONBytes(b []byte) bool {
-	for _, c := range b {
-		switch c {
-		case ' ', '\t', '\n', '\r':
-			continue
-		case '[', '{':
-			return true
-		default:
-			return false
-		}
-	}
-	return false
-}
-
-// ListMergeRequests returns merge-request beads from both the issues table
-// and the wisps table. MRs are created as ephemeral (wisps) by gt mq submit,
-// but bd list only queries the issues table. This method queries the wisps
-// table via bd sql --json to get full data including labels and assignee.
-func (b *Beads) ListMergeRequests(opts ListOptions) ([]*Issue, error) {
-	// 1. Query issues table (bd list) — don't use Ephemeral since bd query
-	// can't parse colons in label values like "gt:merge-request".
-	opts.Ephemeral = false
-	issueResults, err := b.List(opts)
-	if err != nil {
-		return nil, err
-	}
-
-	// Build dedup map from issues
-	seen := make(map[string]bool, len(issueResults))
-	for _, issue := range issueResults {
-		seen[issue.ID] = true
-	}
-
-	// 2. Query wisps table via SQL for merge-request wisps with full data
-	statusFilter := "w.status = 'open'"
-	if opts.Status != "" && strings.EqualFold(opts.Status, "all") {
-		statusFilter = "1=1"
-	} else if opts.Status != "" {
-		statusFilter = fmt.Sprintf("w.status = '%s'", strings.ReplaceAll(strings.ToLower(opts.Status), "'", "''"))
-	}
-
-	labelFilter := "l.label = 'gt:merge-request'"
-	if opts.Label != "" {
-		labelFilter = fmt.Sprintf("l.label = '%s'", strings.ReplaceAll(opts.Label, "'", "''"))
-	}
-
-	query := fmt.Sprintf(
-		"SELECT w.id, w.title, w.description, w.status, w.priority, w.assignee, "+
-			"w.created_at, w.updated_at, w.created_by, "+
-			"GROUP_CONCAT(al.label) as labels_csv "+
-			"FROM wisps w "+
-			"JOIN wisp_labels l ON w.id = l.issue_id "+
-			"LEFT JOIN wisp_labels al ON w.id = al.issue_id "+
-			"WHERE %s AND %s "+
-			"GROUP BY w.id, w.title, w.description, w.status, w.priority, w.assignee, w.created_at, w.updated_at, w.created_by",
-		labelFilter, statusFilter)
-
-	sqlOut, sqlErr := b.run("sql", "--json", query)
-	if sqlErr == nil && len(sqlOut) > 0 && isJSONBytes(sqlOut) {
-		var rows []struct {
-			ID          string `json:"id"`
-			Title       string `json:"title"`
-			Description string `json:"description"`
-			Status      string `json:"status"`
-			Priority    int    `json:"priority"`
-			Assignee    string `json:"assignee"`
-			CreatedAt   string `json:"created_at"`
-			UpdatedAt   string `json:"updated_at"`
-			CreatedBy   string `json:"created_by"`
-			LabelsCSV   string `json:"labels_csv"`
-		}
-		if jsonErr := json.Unmarshal(sqlOut, &rows); jsonErr == nil {
-			for _, row := range rows {
-				if seen[row.ID] {
-					continue
+		label := opts.Label
+		filtered := issues[:0]
+		for _, issue := range issues {
+			for _, l := range issue.Labels {
+				if l == label {
+					filtered = append(filtered, issue)
+					break
 				}
-				issue := &Issue{
-					ID:          row.ID,
-					Title:       row.Title,
-					Description: row.Description,
-					Status:      row.Status,
-					Priority:    row.Priority,
-					Assignee:    row.Assignee,
-					CreatedAt:   row.CreatedAt,
-					UpdatedAt:   row.UpdatedAt,
-					CreatedBy:   row.CreatedBy,
-					Ephemeral:   true,
-				}
-				if row.LabelsCSV != "" {
-					issue.Labels = strings.Split(row.LabelsCSV, ",")
-				}
-				issueResults = append(issueResults, issue)
 			}
 		}
+		issues = filtered
+	} else if opts.Type != "" {
+		filtered := issues[:0]
+		for _, issue := range issues {
+			if issue.Type == opts.Type {
+				filtered = append(filtered, issue)
+			}
+		}
+		issues = filtered
 	}
 
-	return issueResults, nil
+	if opts.NoAssignee {
+		filtered := issues[:0]
+		for _, issue := range issues {
+			if issue.Assignee == "" {
+				filtered = append(filtered, issue)
+			}
+		}
+		issues = filtered
+	}
+
+	if opts.Parent != "" {
+		filtered := issues[:0]
+		for _, issue := range issues {
+			if issue.Parent == opts.Parent {
+				filtered = append(filtered, issue)
+			}
+		}
+		issues = filtered
+	}
+
+	// Apply limit.
+	limit := opts.Limit
+	if limit > 0 && len(issues) > limit {
+		issues = issues[:limit]
+	}
+
+	return issues, nil
 }
 
 // ListByAssignee returns all issues assigned to a specific assignee.
@@ -1004,36 +716,6 @@ func (b *Beads) Show(id string) (*Issue, error) {
 	return issues[0], nil
 }
 
-// FindLatestIssueByTitleAndAssignee finds the newest issue matching the given title and assignee.
-func (b *Beads) FindLatestIssueByTitleAndAssignee(title, assignee string) (*Issue, error) {
-	out, err := b.run("list", "--json", "--limit", "0", "--title", title, "--assignee", assignee)
-	if err != nil {
-		return nil, fmt.Errorf("bd list: %w", err)
-	}
-
-	var issues []*Issue
-	if err := json.Unmarshal(out, &issues); err != nil {
-		return nil, fmt.Errorf("parsing bd list output: %w", err)
-	}
-	if len(issues) == 0 {
-		return nil, ErrNotFound
-	}
-
-	var newest *Issue
-	for _, issue := range issues {
-		if issue.Title != title || issue.Assignee != assignee {
-			continue
-		}
-		if newest == nil || issue.CreatedAt > newest.CreatedAt {
-			newest = issue
-		}
-	}
-	if newest == nil {
-		return nil, ErrNotFound
-	}
-	return newest, nil
-}
-
 // ShowMultiple fetches multiple issues by ID in a single bd call.
 // Returns a map of ID to Issue. Missing IDs are not included in the map.
 func (b *Beads) ShowMultiple(ids []string) (map[string]*Issue, error) {
@@ -1090,11 +772,9 @@ func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
 	if opts.Title != "" {
 		args = append(args, "--title="+opts.Title)
 	}
-	// Labels takes precedence; fall back to deprecated single-label/Type fields.
+	// Labels takes precedence; fall back to deprecated Type conversion
 	if len(opts.Labels) > 0 {
 		args = append(args, "--labels="+strings.Join(opts.Labels, ","))
-	} else if opts.Label != "" {
-		args = append(args, "--labels="+opts.Label)
 	} else if opts.Type != "" {
 		args = append(args, "--labels=gt:"+opts.Type)
 	}
@@ -1150,11 +830,9 @@ func (b *Beads) CreateWithID(id string, opts CreateOptions) (*Issue, error) {
 	if opts.Title != "" {
 		args = append(args, "--title="+opts.Title)
 	}
-	// Labels takes precedence; fall back to deprecated single-label/Type fields.
+	// Labels takes precedence; fall back to deprecated Type conversion
 	if len(opts.Labels) > 0 {
 		args = append(args, "--labels="+strings.Join(opts.Labels, ","))
-	} else if opts.Label != "" {
-		args = append(args, "--labels="+opts.Label)
 	} else if opts.Type != "" {
 		args = append(args, "--labels=gt:"+opts.Type)
 	}
@@ -1426,6 +1104,37 @@ func (b *Beads) AddDependency(issue, dependsOn string) error {
 func (b *Beads) RemoveDependency(issue, dependsOn string) error {
 	_, err := b.run("dep", "remove", issue, dependsOn)
 	return err
+}
+
+// Sync syncs beads with remote.
+func (b *Beads) Sync() error {
+	_, err := b.run("sync")
+	return err
+}
+
+// SyncFromMain syncs beads updates from main branch.
+func (b *Beads) SyncFromMain() error {
+	_, err := b.run("sync", "--from-main")
+	return err
+}
+
+// GetSyncStatus returns the sync status without performing a sync.
+func (b *Beads) GetSyncStatus() (*SyncStatus, error) {
+	out, err := b.run("sync", "--status", "--json")
+	if err != nil {
+		// If sync branch doesn't exist, return empty status
+		if strings.Contains(err.Error(), "does not exist") {
+			return &SyncStatus{}, nil
+		}
+		return nil, err
+	}
+
+	var status SyncStatus
+	if err := json.Unmarshal(out, &status); err != nil {
+		return nil, fmt.Errorf("parsing bd sync status output: %w", err)
+	}
+
+	return &status, nil
 }
 
 // Stats returns repository statistics.
