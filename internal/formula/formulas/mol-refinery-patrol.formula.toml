@@ -76,6 +76,15 @@ resolve that placeholder with this rule:
   Integration branches may ONLY be landed via `gt mq integration land <epic-id>`.
   This applies regardless of `auto_land` configuration. The pre-push hook enforces this.
 
+- FORBIDDEN: Direct git push to the default branch (main). GitHub branch protection requires all
+  merges to main go through pull requests. Use the PR-based merge flow in merge-push step.
+
+- FORBIDDEN: Enabling auto-merge on pull requests (`gh pr merge --auto`). Do not use auto-merge.
+
+- EXCEPTION: The refinery MAY squash-merge polecat PRs it creates WITHOUT waiting for human
+  approval. The ec user has admin bypass rights. Use `gh pr merge <number> --squash` (no --auto).
+  Integration branch PRs (for human feature work) still require human approval.
+
 ## Step Execution Order
 
 You MUST process steps in strict DAG order. Walk through each step sequentially,
@@ -505,33 +514,48 @@ Merge and push. CRITICAL: Notifications come IMMEDIATELY after push.
 **Config: target_branch = {{target_branch}}**
 **Config: delete_merged_branches = {{delete_merged_branches}}**
 
-**Step 1: Merge and Push**
+**Step 1: Merge via Pull Request**
+
+GitHub branch protection requires all merges to main go through PRs (direct push is blocked).
 Determine `<merge-target>` using the **Target Resolution Rule** above.
+
 ```bash
-git checkout <merge-target>
-git merge --ff-only temp
-git push origin <merge-target>
+# Create a PR from the polecat branch to the merge target
+PR_URL=$(gh pr create \
+  --base <merge-target> \
+  --head <polecat-branch> \
+  --title "<commit-title-from-branch>" \
+  --body "Polecat work: <issue-id>\n\n🤖 Polecat: <polecat-name>")
+
+# Extract PR number
+PR_NUMBER=$(echo "$PR_URL" | grep -o '[0-9]*$')
+
+# Squash-merge using admin bypass (no approval needed for polecat PRs)
+gh pr merge $PR_NUMBER --squash
 ```
 
-**Step 1.5: VERIFY PUSH SUCCEEDED (CRITICAL - PATCH-003)**
+If `gh pr merge` fails with "base branch policy prohibits the merge", use `--admin`:
+```bash
+gh pr merge $PR_NUMBER --squash --admin
+```
 
-Push can fail silently (network, auth, hooks). IMMEDIATELY verify:
+**Step 1.5: VERIFY MERGE SUCCEEDED (CRITICAL - PATCH-003)**
+
+Merge can fail silently. IMMEDIATELY verify:
 ```bash
 git fetch origin
-LOCAL_SHA=$(git rev-parse <merge-target>)
-REMOTE_SHA=$(git rev-parse origin/<merge-target>)
-echo "Local:  $LOCAL_SHA"
-echo "Remote: $REMOTE_SHA"
+# Verify the polecat commit is on the merge target:
+git log origin/<merge-target> --oneline | grep "<issue-id>"
 ```
 
-**If SHAs match**: Push succeeded. Continue to Step 2.
+**If commit is on merge target**: Merge succeeded. Continue to Step 2.
 
-**If SHAs differ**: STOP. Push failed silently.
+**If commit is NOT on merge target**: STOP. Merge failed.
 - DO NOT send MERGED notification
 - DO NOT close MR bead
 - DO NOT delete branch
-- Debug the push failure (check `git push` output, network, auth)
-- Retry push and verify again before proceeding
+- Debug the failure (check `gh pr view $PR_NUMBER`)
+- Retry and verify again before proceeding
 
 ⚠️ **STOP HERE - DO NOT PROCEED UNTIL STEPS 1.5 AND 2-3 COMPLETE**
 
