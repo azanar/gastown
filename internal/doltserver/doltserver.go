@@ -2480,6 +2480,19 @@ func EnsureMetadata(townRoot, rigName string) error {
 		_ = json.Unmarshal(data, &existing) // best effort
 	}
 
+	// Resolve the Dolt server port using the same precedence as DefaultConfig:
+	// config.yaml > GT_DOLT_PORT env var > DefaultPort (3307).
+	// Writing this to metadata.json prevents bd from falling back to spawning
+	// its own local Dolt server when the port field is missing.
+	serverPort := DefaultPort
+	if port := readPortFromConfigYAML(townRoot); port > 0 {
+		serverPort = port
+	} else if p := os.Getenv("GT_DOLT_PORT"); p != "" {
+		if port, err := strconv.Atoi(p); err == nil {
+			serverPort = port
+		}
+	}
+
 	// Patch dolt server fields. Only write when values actually change so tracked
 	// metadata.json files in source repos stay clean.
 	changed := false
@@ -2497,6 +2510,11 @@ func EnsureMetadata(townRoot, rigName string) error {
 	}
 	if existing["dolt_database"] == nil || existing["dolt_database"] == "" {
 		existing["dolt_database"] = rigName
+		changed = true
+	}
+	// dolt_server_port: JSON numbers unmarshal as float64, so compare accordingly.
+	if existing["dolt_server_port"] != float64(serverPort) {
+		existing["dolt_server_port"] = serverPort
 		changed = true
 	}
 
