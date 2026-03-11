@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"os"
@@ -22,22 +21,6 @@ import (
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/ui"
 	"github.com/steveyegge/gastown/internal/workspace"
-)
-
-// Timeout durations for handoff subprocess and Dolt calls.
-// These prevent gt handoff from hanging indefinitely when Dolt is slow/unresponsive.
-const (
-	// handoffSubprocessTimeout is the timeout for non-critical subprocess calls
-	// (gt hook, gt mail inbox, bd ready, bd list) during state collection.
-	handoffSubprocessTimeout = 5 * time.Second
-
-	// handoffBdTimeout is the timeout for critical bd calls (create, update)
-	// during handoff mail and bead operations.
-	handoffBdTimeout = 15 * time.Second
-
-	// handoffDoltTimeout is the timeout for Dolt library operations
-	// (molecule cleanup, detach, force-close) during handoff.
-	handoffDoltTimeout = 10 * time.Second
 )
 
 var handoffCmd = &cobra.Command{
@@ -164,10 +147,8 @@ func runHandoff(cmd *cobra.Command, args []string) error {
 		fmt.Printf("%s Polecat detected (%s) - using gt done for handoff\n",
 			style.Bold.Render("🐾"), polecatName)
 		// Polecats don't respawn themselves - Witness handles lifecycle
-		// Call gt done with DEFERRED status to preserve work state (timeout: 15s)
-		doneCtx, doneCancel := context.WithTimeout(context.Background(), handoffBdTimeout)
-		defer doneCancel()
-		doneCmd := exec.CommandContext(doneCtx, "gt", "done", "--status", "DEFERRED")
+		// Call gt done with DEFERRED status to preserve work state
+		doneCmd := exec.Command("gt", "done", "--status", "DEFERRED")
 		doneCmd.Stdout = os.Stdout
 		doneCmd.Stderr = os.Stderr
 		return doneCmd.Run()
@@ -1251,13 +1232,10 @@ func sendHandoffMail(subject, message string) (string, error) {
 		"--", subject,
 	}
 
-	createCtx, createCancel := context.WithTimeout(context.Background(), handoffBdTimeout)
-	defer createCancel()
-
 	cmd := BdCmd(args...).
 		WithAutoCommit().
 		Dir(townRoot).
-		BuildContext(createCtx)
+		Build()
 	cmd.Env = append(cmd.Env, "BEADS_DIR="+filepath.Join(townRoot, ".beads"))
 
 	var stdout, stderr strings.Builder
@@ -1277,14 +1255,11 @@ func sendHandoffMail(subject, message string) (string, error) {
 		return "", fmt.Errorf("bd create did not return bead ID")
 	}
 
-	// Auto-hook the created mail bead (timeout: 15s)
-	hookCtx, hookCancel := context.WithTimeout(context.Background(), handoffBdTimeout)
-	defer hookCancel()
-
+	// Auto-hook the created mail bead
 	hookCmd := BdCmd("update", beadID, "--status=hooked", "--assignee="+agentID).
 		WithAutoCommit().
 		Dir(townRoot).
-		BuildContext(hookCtx)
+		Build()
 	hookCmd.Env = append(hookCmd.Env, "BEADS_DIR="+filepath.Join(townRoot, ".beads"))
 	hookCmd.Stderr = os.Stderr
 
@@ -1362,11 +1337,8 @@ func looksLikeBeadID(s string) bool {
 
 // hookBeadForHandoff attaches a bead to the current agent's hook.
 func hookBeadForHandoff(beadID string) error {
-	// Verify the bead exists first (timeout: 15s)
-	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), handoffBdTimeout)
-	defer verifyCancel()
-
-	verifyCmd := exec.CommandContext(verifyCtx, "bd", "show", beadID, "--json")
+	// Verify the bead exists first
+	verifyCmd := exec.Command("bd", "show", beadID, "--json")
 	if err := verifyCmd.Run(); err != nil {
 		return fmt.Errorf("bead '%s' not found", beadID)
 	}
@@ -1384,11 +1356,8 @@ func hookBeadForHandoff(beadID string) error {
 		return nil
 	}
 
-	// Pin the bead using bd update (timeout: 15s)
-	pinCtx, pinCancel := context.WithTimeout(context.Background(), handoffBdTimeout)
-	defer pinCancel()
-
-	pinCmd := exec.CommandContext(pinCtx, "bd", "update", beadID, "--status=pinned", "--assignee="+agentID)
+	// Pin the bead using bd update (discovery-based approach)
+	pinCmd := exec.Command("bd", "update", beadID, "--status=pinned", "--assignee="+agentID)
 	pinCmd.Stderr = os.Stderr
 	if err := pinCmd.Run(); err != nil {
 		return fmt.Errorf("pinning bead: %w", err)
@@ -1410,10 +1379,8 @@ func collectHandoffState() string {
 		parts = append(parts, gitState)
 	}
 
-	// Get hooked work (non-critical — timeout after 5s)
-	hookCtx, hookCancel := context.WithTimeout(context.Background(), handoffSubprocessTimeout)
-	defer hookCancel()
-	hookOutput, err := exec.CommandContext(hookCtx, "gt", "hook").Output()
+	// Get hooked work
+	hookOutput, err := exec.Command("gt", "hook").Output()
 	if err == nil {
 		hookStr := strings.TrimSpace(string(hookOutput))
 		if hookStr != "" && !strings.Contains(hookStr, "Nothing on hook") {
@@ -1421,10 +1388,8 @@ func collectHandoffState() string {
 		}
 	}
 
-	// Get inbox summary (non-critical — timeout after 5s)
-	inboxCtx, inboxCancel := context.WithTimeout(context.Background(), handoffSubprocessTimeout)
-	defer inboxCancel()
-	inboxOutput, err := exec.CommandContext(inboxCtx, "gt", "mail", "inbox").Output()
+	// Get inbox summary (first few messages)
+	inboxOutput, err := exec.Command("gt", "mail", "inbox").Output()
 	if err == nil {
 		inboxStr := strings.TrimSpace(string(inboxOutput))
 		if inboxStr != "" && !strings.Contains(inboxStr, "Inbox empty") {
@@ -1437,10 +1402,8 @@ func collectHandoffState() string {
 		}
 	}
 
-	// Get ready beads (non-critical — timeout after 5s)
-	readyCtx, readyCancel := context.WithTimeout(context.Background(), handoffSubprocessTimeout)
-	defer readyCancel()
-	readyOutput, err := exec.CommandContext(readyCtx, "bd", "ready").Output()
+	// Get ready beads
+	readyOutput, err := exec.Command("bd", "ready").Output()
 	if err == nil {
 		readyStr := strings.TrimSpace(string(readyOutput))
 		if readyStr != "" && !strings.Contains(readyStr, "No issues ready") {
@@ -1453,10 +1416,8 @@ func collectHandoffState() string {
 		}
 	}
 
-	// Get in-progress beads (non-critical — timeout after 5s)
-	ipCtx, ipCancel := context.WithTimeout(context.Background(), handoffSubprocessTimeout)
-	defer ipCancel()
-	inProgressOutput, err := exec.CommandContext(ipCtx, "bd", "list", "--status=in_progress").Output()
+	// Get in-progress beads
+	inProgressOutput, err := exec.Command("bd", "list", "--status=in_progress").Output()
 	if err == nil {
 		ipStr := strings.TrimSpace(string(inProgressOutput))
 		if ipStr != "" && !strings.Contains(ipStr, "No issues") {
@@ -1595,43 +1556,29 @@ func cleanupMoleculeOnHandoff() {
 
 	molID := attachment.AttachedMolecule
 
-	// Run molecule cleanup with a timeout to prevent hanging on Dolt.
-	// All operations are non-fatal — handoff must succeed even if cleanup fails.
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
+	// Close descendant steps (the leaked wisps)
+	if n := closeDescendants(b, molID); n > 0 {
+		fmt.Fprintf(os.Stderr, "handoff: closed %d molecule step(s) for %s\n", n, molID)
+	}
 
-		// Close descendant steps (the leaked wisps)
-		if n := closeDescendants(b, molID); n > 0 {
-			fmt.Fprintf(os.Stderr, "handoff: closed %d molecule step(s) for %s\n", n, molID)
-		}
+	// Detach molecule with audit trail
+	if _, err := b.DetachMoleculeWithAudit(handoffBead.ID, beads.DetachOptions{
+		Operation: "squash",
+		Reason:    "handoff: session cycling",
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "handoff: warning: detach molecule audit failed: %v\n", err)
+	}
 
-		// Detach molecule with audit trail
-		if _, err := b.DetachMoleculeWithAudit(handoffBead.ID, beads.DetachOptions{
-			Operation: "squash",
-			Reason:    "handoff: session cycling",
-		}); err != nil {
-			fmt.Fprintf(os.Stderr, "handoff: warning: detach molecule audit failed: %v\n", err)
-		}
+	// Close all descendant wisps first, then the molecule root.
+	// Without this, handoff leaks orphan wisps into the DB.
+	// Best-effort in handoff path — log but proceed.
+	if _, err := forceCloseDescendants(b, molID); err != nil {
+		style.PrintWarning("handoff: could not close descendants of %s: %v", molID, err)
+	}
 
-		// Close all descendant wisps first, then the molecule root.
-		// Without this, handoff leaks orphan wisps into the DB.
-		// Best-effort in handoff path — log but proceed.
-		if _, err := forceCloseDescendants(b, molID); err != nil {
-			style.PrintWarning("handoff: could not close descendants of %s: %v", molID, err)
-		}
-
-		// Force-close the molecule root wisp
-		if err := b.ForceCloseWithReason("handoff", molID); err != nil {
-			fmt.Fprintf(os.Stderr, "handoff: warning: couldn't close molecule %s: %v\n", molID, err)
-		}
-	}()
-
-	select {
-	case <-done:
-		// Cleanup completed successfully
-	case <-time.After(handoffDoltTimeout):
-		fmt.Fprintf(os.Stderr, "handoff: warning: molecule cleanup timed out after %v, continuing\n", handoffDoltTimeout)
+	// Force-close the molecule root wisp
+	if err := b.ForceCloseWithReason("handoff", molID); err != nil {
+		fmt.Fprintf(os.Stderr, "handoff: warning: couldn't close molecule %s: %v\n", molID, err)
 	}
 }
 

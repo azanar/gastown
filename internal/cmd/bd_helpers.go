@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"io"
 	"os"
 	"os/exec"
@@ -134,18 +133,6 @@ func (b *bdCmd) buildEnv() []string {
 func (b *bdCmd) Build() *exec.Cmd {
 	args := b.resolvedArgs()
 	cmd := exec.Command("bd", args...)
-	cmd.Dir = b.dir
-	cmd.Env = b.buildEnv()
-	cmd.Stderr = b.stderr
-	return cmd
-}
-
-// BuildContext returns a configured exec.Cmd with context for timeout/cancellation.
-// The context controls the lifetime of the subprocess — if it expires, the process
-// is killed. Use this for bd calls that may hang on Dolt (e.g., during handoff).
-func (b *bdCmd) BuildContext(ctx context.Context) *exec.Cmd {
-	args := b.resolvedArgs()
-	cmd := exec.CommandContext(ctx, "bd", args...)
 	cmd.Dir = b.dir
 	cmd.Env = b.buildEnv()
 	cmd.Stderr = b.stderr

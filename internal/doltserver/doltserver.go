@@ -1288,9 +1288,7 @@ func Start(townRoot string) error {
 		}
 
 		if err := CheckServerReachable(townRoot); err == nil {
-			// Server is up — clean stale port files so bd connects to the right instance (gt-t642)
-			cleanStalePortFiles(townRoot, config.Port)
-			return nil
+			return nil // Server is up and accepting connections
 		} else {
 			lastErr = err
 		}
@@ -1330,85 +1328,6 @@ func cleanupStaleDoltLock(databaseDir string) error {
 	// lsof found processes - lock is legitimately held (likely by bd)
 	// This is not an error condition; dolt server will handle the conflict
 	return nil
-}
-
-// cleanStalePortFiles removes or updates dolt-server.port files and metadata.json
-// entries that point to the wrong Dolt port. This prevents bd from connecting to a
-// dead or rogue local server instead of the central town server. (gt-t642)
-func cleanStalePortFiles(townRoot string, correctPort int) {
-	correctPortStr := strconv.Itoa(correctPort)
-
-	// Walk the town root looking for dolt-server.port files
-	_ = filepath.Walk(townRoot, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-		// Skip .dolt-data internals (database storage, not config)
-		if info.IsDir() && info.Name() == ".dolt" {
-			return filepath.SkipDir
-		}
-
-		if info.Name() == "dolt-server.port" {
-			data, readErr := os.ReadFile(path)
-			if readErr != nil {
-				return nil
-			}
-			portStr := strings.TrimSpace(string(data))
-			if portStr != correctPortStr {
-				// Stale — overwrite with correct port
-				if writeErr := os.WriteFile(path, []byte(correctPortStr), 0644); writeErr != nil {
-					fmt.Fprintf(os.Stderr, "Warning: could not fix stale port file %s: %v\n", path, writeErr)
-				} else {
-					relPath, _ := filepath.Rel(townRoot, path)
-					fmt.Fprintf(os.Stderr, "Fixed stale port file %s (%s → %s)\n", relPath, portStr, correctPortStr)
-				}
-			}
-		}
-
-		if info.Name() == "metadata.json" {
-			fixMetadataPort(path, correctPort)
-		}
-
-		return nil
-	})
-}
-
-// fixMetadataPort updates dolt_server_port in a metadata.json if it's stale.
-func fixMetadataPort(path string, correctPort int) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return
-	}
-
-	var meta map[string]interface{}
-	if err := json.Unmarshal(data, &meta); err != nil {
-		return
-	}
-
-	// Only fix if dolt_server_port is present and wrong
-	portVal, ok := meta["dolt_server_port"]
-	if !ok {
-		return
-	}
-	portFloat, ok := portVal.(float64)
-	if !ok || int(portFloat) == correctPort {
-		return
-	}
-
-	meta["dolt_server_port"] = correctPort
-	newData, err := json.MarshalIndent(meta, "", "  ")
-	if err != nil {
-		return
-	}
-	// Append newline for consistency
-	newData = append(newData, '\n')
-
-	if writeErr := os.WriteFile(path, newData, 0644); writeErr != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not fix stale metadata.json %s: %v\n", path, writeErr)
-	} else {
-		dir := filepath.Dir(path)
-		fmt.Fprintf(os.Stderr, "Fixed stale dolt_server_port in %s (%d → %d)\n", dir, int(portFloat), correctPort)
-	}
 }
 
 // Stop stops the Dolt SQL server.
