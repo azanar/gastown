@@ -46,6 +46,28 @@ func isClaimStale(updatedAt string, timeout time.Duration) (stale bool, parseErr
 	return time.Since(t) >= timeout, nil
 }
 
+// PRRequirementConfig defines a single GitHub PR requirement to check before merging.
+// Requirements are evaluated via the GitHub API (gh CLI) before gates run.
+type PRRequirementConfig struct {
+	// Reviewer is a specific GitHub login whose review must match the required state.
+	// If empty, the requirement applies to any reviewer.
+	Reviewer string `json:"reviewer,omitempty"`
+
+	// State is the required review state (e.g., "APPROVED", "CHANGES_REQUESTED").
+	// Used with Reviewer to require a specific reviewer to have a specific state.
+	State string `json:"state,omitempty"`
+
+	// MinApprovals is the minimum number of approving reviews required.
+	// When set, counts APPROVED reviews (optionally excluding bots).
+	MinApprovals int `json:"min_approvals,omitempty"`
+
+	// ExcludeBots excludes bot accounts (login ending in [bot]) when counting approvals.
+	ExcludeBots bool `json:"exclude_bots,omitempty"`
+
+	// NoChangesRequested requires that no reviewer has state=CHANGES_REQUESTED.
+	NoChangesRequested bool `json:"no_changes_requested,omitempty"`
+}
+
 // GateConfig defines a single quality gate command.
 type GateConfig struct {
 	// Cmd is the shell command to execute.
@@ -127,6 +149,12 @@ type MergeQueueConfig struct {
 	// Batch holds configuration for the batch-then-bisect merge queue.
 	// When nil or MaxBatchSize <= 1, batching is disabled and MRs process sequentially.
 	Batch *BatchConfig `json:"batch,omitempty"`
+
+	// PRRequirements defines named GitHub PR review requirements that must be
+	// satisfied before the refinery will merge a PR. These are evaluated via the
+	// GitHub API before gates run. When empty, no PR requirements are enforced
+	// (backward compatible).
+	PRRequirements map[string]*PRRequirementConfig `json:"pr_requirements,omitempty"`
 }
 
 // DefaultMergeQueueConfig returns sensible defaults for merge queue configuration.
@@ -296,8 +324,9 @@ func (e *Engineer) LoadConfig() error {
 		PollInterval         *string                    `json:"poll_interval"`
 		MaxConcurrent        *int                       `json:"max_concurrent"`
 		StaleClaimTimeout    *string                    `json:"stale_claim_timeout"`
-		Gates                map[string]*gateConfigRaw  `json:"gates"`
-		GatesParallel        *bool                      `json:"gates_parallel"`
+		Gates                map[string]*gateConfigRaw        `json:"gates"`
+		GatesParallel        *bool                            `json:"gates_parallel"`
+		PRRequirements       map[string]*PRRequirementConfig  `json:"pr_requirements"`
 	}
 
 	if err := json.Unmarshal(rawConfig.MergeQueue, &mqRaw); err != nil {
@@ -364,6 +393,11 @@ func (e *Engineer) LoadConfig() error {
 	}
 	if mqRaw.GatesParallel != nil {
 		e.config.GatesParallel = *mqRaw.GatesParallel
+	}
+
+	// Parse PR requirements configuration
+	if mqRaw.PRRequirements != nil {
+		e.config.PRRequirements = mqRaw.PRRequirements
 	}
 
 	return nil
@@ -470,6 +504,16 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 			}
 		}
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Pushed %d submodule(s)\n", len(subChanges))
+	}
+
+	// Step 3.7: Check PR requirements before running gates.
+	// These are GitHub API checks (review approvals, no changes requested, etc.)
+	// that must be satisfied before the refinery will merge.
+	if len(e.config.PRRequirements) > 0 {
+		prResult := e.checkPRRequirements(ctx, branch)
+		if !prResult.Success {
+			return prResult
+		}
 	}
 
 	// Step 4: Run quality gates (or legacy tests) if configured.
@@ -832,6 +876,177 @@ func (e *Engineer) runGates(ctx context.Context) ProcessResult {
 
 	_, _ = fmt.Fprintln(e.output, "[Engineer] All quality gates passed")
 	return ProcessResult{Success: true}
+}
+
+// prReview represents a single GitHub PR review from the API.
+type prReview struct {
+	Author struct {
+		Login string `json:"login"`
+	} `json:"author"`
+	State string `json:"state"`
+}
+
+// checkPRRequirements evaluates configured PR review requirements for a branch.
+// Returns a ProcessResult with Success=true if all requirements are met, or
+// Success=false with an error describing which requirement failed.
+// If no PR requirements are configured, returns Success=true immediately.
+func (e *Engineer) checkPRRequirements(ctx context.Context, branch string) ProcessResult {
+	reqs := e.config.PRRequirements
+	if len(reqs) == 0 {
+		return ProcessResult{Success: true}
+	}
+
+	_, _ = fmt.Fprintf(e.output, "[Engineer] Checking %d PR requirement(s) for branch %s\n", len(reqs), branch)
+
+	// Look up the PR number for this branch via gh CLI
+	prNum, err := e.findPRForBranch(ctx, branch)
+	if err != nil {
+		return ProcessResult{
+			Success: false,
+			Error:   fmt.Sprintf("pr_requirements: failed to find PR for branch %s: %v", branch, err),
+		}
+	}
+	if prNum == "" {
+		return ProcessResult{
+			Success: false,
+			Error:   fmt.Sprintf("pr_requirements: no open PR found for branch %s", branch),
+		}
+	}
+
+	// Fetch reviews for the PR
+	reviews, err := e.fetchPRReviews(ctx, prNum)
+	if err != nil {
+		return ProcessResult{
+			Success: false,
+			Error:   fmt.Sprintf("pr_requirements: failed to fetch reviews for PR #%s: %v", prNum, err),
+		}
+	}
+
+	// Evaluate each requirement
+	// Sort requirement names for deterministic ordering
+	reqNames := make([]string, 0, len(reqs))
+	for name := range reqs {
+		reqNames = append(reqNames, name)
+	}
+	sort.Strings(reqNames)
+
+	var failures []string
+	for _, name := range reqNames {
+		req := reqs[name]
+		if err := e.evaluatePRRequirement(name, req, reviews); err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %s", name, err))
+			_, _ = fmt.Fprintf(e.output, "[Engineer] PR requirement %q: FAILED - %s\n", name, err)
+		} else {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] PR requirement %q: satisfied\n", name)
+		}
+	}
+
+	if len(failures) > 0 {
+		return ProcessResult{
+			Success: false,
+			Error:   fmt.Sprintf("pr_requirements not met: %s", strings.Join(failures, "; ")),
+		}
+	}
+
+	_, _ = fmt.Fprintln(e.output, "[Engineer] All PR requirements satisfied")
+	return ProcessResult{Success: true}
+}
+
+// findPRForBranch uses `gh pr list` to find the PR number for a branch.
+func (e *Engineer) findPRForBranch(ctx context.Context, branch string) (string, error) {
+	cmd := exec.CommandContext(ctx, "gh", "pr", "list", "--head", branch, "--json", "number", "--limit", "1") //nolint:gosec // G204: branch is from trusted MR data
+	cmd.Dir = e.workDir
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("%v: %s", err, strings.TrimSpace(stderr.String()))
+	}
+
+	var prs []struct {
+		Number int `json:"number"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &prs); err != nil {
+		return "", fmt.Errorf("parsing gh output: %w", err)
+	}
+	if len(prs) == 0 {
+		return "", nil
+	}
+	return fmt.Sprintf("%d", prs[0].Number), nil
+}
+
+// fetchPRReviews fetches all reviews for a PR using `gh pr view`.
+func (e *Engineer) fetchPRReviews(ctx context.Context, prNumber string) ([]prReview, error) {
+	cmd := exec.CommandContext(ctx, "gh", "pr", "view", prNumber, "--json", "reviews") //nolint:gosec // G204: prNumber is from our own lookup
+	cmd.Dir = e.workDir
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("%v: %s", err, strings.TrimSpace(stderr.String()))
+	}
+
+	var result struct {
+		Reviews []prReview `json:"reviews"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		return nil, fmt.Errorf("parsing reviews: %w", err)
+	}
+	return result.Reviews, nil
+}
+
+// evaluatePRRequirement checks a single PR requirement against the reviews.
+// Returns nil if satisfied, or an error describing the failure.
+func (e *Engineer) evaluatePRRequirement(name string, req *PRRequirementConfig, reviews []prReview) error {
+	// Deduplicate reviews: keep only the latest review per author.
+	// GitHub returns reviews in chronological order, so last entry wins.
+	latestByAuthor := make(map[string]prReview)
+	for _, r := range reviews {
+		if r.Author.Login != "" {
+			latestByAuthor[r.Author.Login] = r
+		}
+	}
+
+	// Check: specific reviewer must have specific state
+	if req.Reviewer != "" && req.State != "" {
+		review, exists := latestByAuthor[req.Reviewer]
+		if !exists {
+			return fmt.Errorf("reviewer %q has not reviewed (need state=%s)", req.Reviewer, req.State)
+		}
+		if !strings.EqualFold(review.State, req.State) {
+			return fmt.Errorf("reviewer %q has state=%s (need %s)", req.Reviewer, review.State, req.State)
+		}
+		return nil
+	}
+
+	// Check: no changes requested from any reviewer
+	if req.NoChangesRequested {
+		for login, review := range latestByAuthor {
+			if strings.EqualFold(review.State, "CHANGES_REQUESTED") {
+				return fmt.Errorf("reviewer %q has CHANGES_REQUESTED", login)
+			}
+		}
+	}
+
+	// Check: minimum approvals
+	if req.MinApprovals > 0 {
+		approvalCount := 0
+		for _, review := range latestByAuthor {
+			if req.ExcludeBots && strings.HasSuffix(review.Author.Login, "[bot]") {
+				continue
+			}
+			if strings.EqualFold(review.State, "APPROVED") {
+				approvalCount++
+			}
+		}
+		if approvalCount < req.MinApprovals {
+			return fmt.Errorf("need %d approval(s), got %d", req.MinApprovals, approvalCount)
+		}
+	}
+
+	return nil
 }
 
 // syncCrewWorkspaces pulls latest changes to all crew workspaces.

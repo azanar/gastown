@@ -804,3 +804,264 @@ func TestIsClaimStale(t *testing.T) {
 		})
 	}
 }
+
+func TestEngineer_LoadConfig_WithPRRequirements(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	config := map[string]interface{}{
+		"merge_queue": map[string]interface{}{
+			"pr_requirements": map[string]interface{}{
+				"coderabbit_approved": map[string]interface{}{
+					"reviewer": "coderabbitai[bot]",
+					"state":    "APPROVED",
+				},
+				"human_approved": map[string]interface{}{
+					"min_approvals": 1,
+					"exclude_bots":  true,
+				},
+				"no_changes_requested": map[string]interface{}{
+					"no_changes_requested": true,
+				},
+			},
+		},
+	}
+
+	data, _ := json.MarshalIndent(config, "", "  ")
+	if err := os.WriteFile(filepath.Join(tmpDir, "config.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &rig.Rig{Name: "test-rig", Path: tmpDir}
+	e := NewEngineer(r)
+
+	if err := e.LoadConfig(); err != nil {
+		t.Fatalf("unexpected error loading config: %v", err)
+	}
+
+	if len(e.config.PRRequirements) != 3 {
+		t.Fatalf("expected 3 PR requirements, got %d", len(e.config.PRRequirements))
+	}
+
+	cr := e.config.PRRequirements["coderabbit_approved"]
+	if cr.Reviewer != "coderabbitai[bot]" {
+		t.Errorf("expected reviewer 'coderabbitai[bot]', got %q", cr.Reviewer)
+	}
+	if cr.State != "APPROVED" {
+		t.Errorf("expected state 'APPROVED', got %q", cr.State)
+	}
+
+	ha := e.config.PRRequirements["human_approved"]
+	if ha.MinApprovals != 1 {
+		t.Errorf("expected min_approvals 1, got %d", ha.MinApprovals)
+	}
+	if !ha.ExcludeBots {
+		t.Error("expected exclude_bots true")
+	}
+
+	ncr := e.config.PRRequirements["no_changes_requested"]
+	if !ncr.NoChangesRequested {
+		t.Error("expected no_changes_requested true")
+	}
+}
+
+func TestEvaluatePRRequirement_SpecificReviewerApproved(t *testing.T) {
+	r := &rig.Rig{Name: "test-rig", Path: t.TempDir()}
+	e := NewEngineer(r)
+
+	reviews := []prReview{
+		{State: "APPROVED"},
+	}
+	reviews[0].Author.Login = "coderabbitai[bot]"
+
+	req := &PRRequirementConfig{
+		Reviewer: "coderabbitai[bot]",
+		State:    "APPROVED",
+	}
+
+	err := e.evaluatePRRequirement("cr_approved", req, reviews)
+	if err != nil {
+		t.Errorf("expected requirement satisfied, got error: %v", err)
+	}
+}
+
+func TestEvaluatePRRequirement_SpecificReviewerWrongState(t *testing.T) {
+	r := &rig.Rig{Name: "test-rig", Path: t.TempDir()}
+	e := NewEngineer(r)
+
+	reviews := []prReview{
+		{State: "COMMENTED"},
+	}
+	reviews[0].Author.Login = "coderabbitai[bot]"
+
+	req := &PRRequirementConfig{
+		Reviewer: "coderabbitai[bot]",
+		State:    "APPROVED",
+	}
+
+	err := e.evaluatePRRequirement("cr_approved", req, reviews)
+	if err == nil {
+		t.Error("expected failure for wrong state")
+	}
+	if !strings.Contains(err.Error(), "COMMENTED") {
+		t.Errorf("expected error to mention COMMENTED, got: %s", err)
+	}
+}
+
+func TestEvaluatePRRequirement_SpecificReviewerNotReviewed(t *testing.T) {
+	r := &rig.Rig{Name: "test-rig", Path: t.TempDir()}
+	e := NewEngineer(r)
+
+	req := &PRRequirementConfig{
+		Reviewer: "coderabbitai[bot]",
+		State:    "APPROVED",
+	}
+
+	err := e.evaluatePRRequirement("cr_approved", req, nil)
+	if err == nil {
+		t.Error("expected failure when reviewer hasn't reviewed")
+	}
+	if !strings.Contains(err.Error(), "has not reviewed") {
+		t.Errorf("expected 'has not reviewed' error, got: %s", err)
+	}
+}
+
+func TestEvaluatePRRequirement_MinApprovals(t *testing.T) {
+	r := &rig.Rig{Name: "test-rig", Path: t.TempDir()}
+	e := NewEngineer(r)
+
+	reviews := []prReview{
+		{State: "APPROVED"},
+		{State: "APPROVED"},
+		{State: "COMMENTED"},
+	}
+	reviews[0].Author.Login = "alice"
+	reviews[1].Author.Login = "bob"
+	reviews[2].Author.Login = "carol"
+
+	req := &PRRequirementConfig{MinApprovals: 2}
+
+	err := e.evaluatePRRequirement("human_approved", req, reviews)
+	if err != nil {
+		t.Errorf("expected requirement satisfied, got error: %v", err)
+	}
+}
+
+func TestEvaluatePRRequirement_MinApprovals_Insufficient(t *testing.T) {
+	r := &rig.Rig{Name: "test-rig", Path: t.TempDir()}
+	e := NewEngineer(r)
+
+	reviews := []prReview{
+		{State: "APPROVED"},
+		{State: "COMMENTED"},
+	}
+	reviews[0].Author.Login = "alice"
+	reviews[1].Author.Login = "bob"
+
+	req := &PRRequirementConfig{MinApprovals: 2}
+
+	err := e.evaluatePRRequirement("human_approved", req, reviews)
+	if err == nil {
+		t.Error("expected failure for insufficient approvals")
+	}
+	if !strings.Contains(err.Error(), "need 2") {
+		t.Errorf("expected 'need 2' in error, got: %s", err)
+	}
+}
+
+func TestEvaluatePRRequirement_MinApprovals_ExcludeBots(t *testing.T) {
+	r := &rig.Rig{Name: "test-rig", Path: t.TempDir()}
+	e := NewEngineer(r)
+
+	reviews := []prReview{
+		{State: "APPROVED"},
+		{State: "APPROVED"},
+	}
+	reviews[0].Author.Login = "coderabbitai[bot]"
+	reviews[1].Author.Login = "alice"
+
+	req := &PRRequirementConfig{
+		MinApprovals: 2,
+		ExcludeBots:  true,
+	}
+
+	err := e.evaluatePRRequirement("human_approved", req, reviews)
+	if err == nil {
+		t.Error("expected failure when bot approval excluded")
+	}
+	if !strings.Contains(err.Error(), "need 2") {
+		t.Errorf("expected 'need 2' in error, got: %s", err)
+	}
+}
+
+func TestEvaluatePRRequirement_NoChangesRequested(t *testing.T) {
+	r := &rig.Rig{Name: "test-rig", Path: t.TempDir()}
+	e := NewEngineer(r)
+
+	reviews := []prReview{
+		{State: "APPROVED"},
+		{State: "COMMENTED"},
+	}
+	reviews[0].Author.Login = "alice"
+	reviews[1].Author.Login = "bob"
+
+	req := &PRRequirementConfig{NoChangesRequested: true}
+
+	err := e.evaluatePRRequirement("no_cr", req, reviews)
+	if err != nil {
+		t.Errorf("expected requirement satisfied, got error: %v", err)
+	}
+}
+
+func TestEvaluatePRRequirement_NoChangesRequested_Fails(t *testing.T) {
+	r := &rig.Rig{Name: "test-rig", Path: t.TempDir()}
+	e := NewEngineer(r)
+
+	reviews := []prReview{
+		{State: "APPROVED"},
+		{State: "CHANGES_REQUESTED"},
+	}
+	reviews[0].Author.Login = "alice"
+	reviews[1].Author.Login = "bob"
+
+	req := &PRRequirementConfig{NoChangesRequested: true}
+
+	err := e.evaluatePRRequirement("no_cr", req, reviews)
+	if err == nil {
+		t.Error("expected failure when changes are requested")
+	}
+	if !strings.Contains(err.Error(), "bob") {
+		t.Errorf("expected error to mention 'bob', got: %s", err)
+	}
+}
+
+func TestEvaluatePRRequirement_LatestReviewWins(t *testing.T) {
+	r := &rig.Rig{Name: "test-rig", Path: t.TempDir()}
+	e := NewEngineer(r)
+
+	// Same reviewer: first CHANGES_REQUESTED, then APPROVED (latest wins)
+	reviews := []prReview{
+		{State: "CHANGES_REQUESTED"},
+		{State: "APPROVED"},
+	}
+	reviews[0].Author.Login = "alice"
+	reviews[1].Author.Login = "alice"
+
+	req := &PRRequirementConfig{NoChangesRequested: true}
+
+	err := e.evaluatePRRequirement("no_cr", req, reviews)
+	if err != nil {
+		t.Errorf("expected latest review (APPROVED) to win, got error: %v", err)
+	}
+}
+
+func TestCheckPRRequirements_NoneConfigured(t *testing.T) {
+	r := &rig.Rig{Name: "test-rig", Path: t.TempDir()}
+	e := NewEngineer(r)
+	e.output = io.Discard
+	// No PR requirements configured
+
+	result := e.checkPRRequirements(context.Background(), "feature-branch")
+	if !result.Success {
+		t.Errorf("expected success with no PR requirements, got error: %s", result.Error)
+	}
+}
