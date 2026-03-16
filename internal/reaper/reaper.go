@@ -22,7 +22,7 @@ import (
 var validDBName = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 
 // DefaultDatabases is the static fallback list of known production databases.
-var DefaultDatabases = []string{"hq", "beads", "gastown"}
+var DefaultDatabases = []string{"hq", "gastown", "monorepo"}
 
 // testPollutionPrefixes are database name prefixes created by tests.
 var testPollutionPrefixes = []string{"testdb_", "beads_t", "beads_pt", "doctest_"}
@@ -58,7 +58,7 @@ func DiscoverDatabases(host string, port int) []string {
 		if err := rows.Scan(&name); err != nil {
 			continue
 		}
-		if name == "information_schema" || name == "mysql" {
+		if name == "information_schema" || name == "mysql" || name == "dolt" {
 			continue
 		}
 		lower := strings.ToLower(name)
