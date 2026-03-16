@@ -469,9 +469,55 @@ The refinery will run gates normally (slower but still correct).
 **Exit criteria:** Branch rebased onto latest origin/{{base_branch}}, all configured gates pass."""
 
 [[steps]]
-id = "submit-and-exit"
-title = "Submit work and self-clean"
+id = "cr-approval"
+title = "Verify CodeRabbit approval"
 needs = ["pre-verify"]
+description = """
+Ensure CodeRabbit has approved your PR before submitting.
+
+CodeRabbit (coderabbitai[bot]) reviews all PRs automatically. You MUST have its
+approval before signaling done. A comment or CHANGES_REQUESTED is not sufficient —
+only state=APPROVED counts.
+
+**1. Check if a PR exists for your branch:**
+```bash
+gh pr view --json number,url,reviews 2>/dev/null
+```
+
+If no PR exists (merge-queue workflow without PR), skip this step entirely.
+
+**2. Check CodeRabbit review state:**
+```bash
+gh pr view --json reviews --jq '.reviews[] | select(.author.login == "coderabbitai[bot]") | .state'
+```
+
+**3. Interpret the result:**
+
+| Result | Action |
+|--------|--------|
+| `APPROVED` | Proceed to submit |
+| `CHANGES_REQUESTED` | Fix the issues CR flagged, push, wait for re-review |
+| `COMMENTED` (or empty) | CR hasn't finished or only left comments — wait and re-check |
+| No PR exists | Skip this step (MQ-only workflow) |
+
+**4. If CHANGES_REQUESTED:**
+- Read the CR comments: `gh pr view --json comments --jq '.comments[] | select(.author.login == "coderabbitai[bot]") | .body'`
+- Address each issue
+- Commit and push fixes
+- Wait for CR to re-review (re-run step 2)
+
+**5. If CR is slow or stuck:**
+Wait up to 5 minutes. If still no review, proceed with a note:
+```bash
+bd update {{issue}} --notes "CR: no review after 5 min wait, proceeding"
+```
+
+**Exit criteria:** CodeRabbit state is APPROVED, or no PR exists (MQ-only), or CR timed out with note logged."""
+
+[[steps]]
+id = "submit-mr"
+title = "Submit MR and enter awaiting_verdict"
+needs = ["cr-approval"]
 description = """
 Submit your work and clean up. You cease to exist after this step.
 
