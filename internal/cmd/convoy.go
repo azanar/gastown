@@ -896,6 +896,46 @@ func runConvoyCheck(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// closeConvoyIfComplete checks whether all tracked issues in a convoy are resolved
+// and closes the convoy if so. Returns (true, nil) if the convoy was closed or
+// would be closed (dry-run), (false, nil) if not ready, or (false, err) on failure.
+func closeConvoyIfComplete(townBeads, convoyID, title string, tracked []trackedIssueInfo, dryRun bool) (bool, error) {
+	allClosed := true
+	openCount := 0
+	for _, t := range tracked {
+		if t.Status != "closed" && t.Status != "tombstone" {
+			allClosed = false
+			openCount++
+		}
+	}
+
+	if !allClosed {
+		fmt.Printf("%s Convoy %s has %d open issue(s) remaining\n", style.Dim.Render("○"), convoyID, openCount)
+		return false, nil
+	}
+
+	if dryRun {
+		fmt.Printf("%s Would auto-close convoy 🚚 %s: %s\n", style.Warning.Render("⚠"), convoyID, title)
+		return true, nil
+	}
+
+	reason := "All tracked issues completed"
+	if len(tracked) == 0 {
+		reason = "Empty convoy (0 tracked issues) — auto-closed as definitionally complete"
+	}
+	closeArgs := []string{"close", convoyID, "-r", reason}
+	closeCmd := exec.Command("bd", closeArgs...)
+	closeCmd.Dir = townBeads
+
+	if err := closeCmd.Run(); err != nil {
+		return false, fmt.Errorf("closing convoy: %w", err)
+	}
+
+	fmt.Printf("%s Auto-closed convoy 🚚 %s: %s\n", style.Bold.Render("✓"), convoyID, title)
+	notifyConvoyCompletion(townBeads, convoyID, title)
+	return true, nil
+}
+
 // checkSingleConvoy checks a specific convoy and closes it if all tracked issues are complete.
 func checkSingleConvoy(townBeads, convoyID string, dryRun bool) error {
 	// Get convoy details
@@ -945,47 +985,9 @@ func checkSingleConvoy(townBeads, convoyID string, dryRun bool) error {
 	if err != nil {
 		return fmt.Errorf("checking convoy %s: %w", convoyID, err)
 	}
-	// A convoy with 0 tracked issues is definitionally complete
-	// (tracking deps were likely lost). Treat as all-closed.
-	allClosed := true
-	openCount := 0
-	for _, t := range tracked {
-		if t.Status != "closed" && t.Status != "tombstone" {
-			allClosed = false
-			openCount++
-		}
-	}
 
-	if !allClosed {
-		fmt.Printf("%s Convoy %s has %d open issue(s) remaining\n", style.Dim.Render("○"), convoyID, openCount)
-		return nil
-	}
-
-	// All tracked issues are complete (or convoy is empty) - close the convoy
-	if dryRun {
-		fmt.Printf("%s Would auto-close convoy 🚚 %s: %s\n", style.Warning.Render("⚠"), convoyID, convoy.Title)
-		return nil
-	}
-
-	// Actually close the convoy
-	reason := "All tracked issues completed"
-	if len(tracked) == 0 {
-		reason = "Empty convoy (0 tracked issues) — auto-closed as definitionally complete"
-	}
-	closeArgs := []string{"close", convoyID, "-r", reason}
-	closeCmd := exec.Command("bd", closeArgs...)
-	closeCmd.Dir = townBeads
-
-	if err := closeCmd.Run(); err != nil {
-		return fmt.Errorf("closing convoy: %w", err)
-	}
-
-	fmt.Printf("%s Auto-closed convoy 🚚 %s: %s\n", style.Bold.Render("✓"), convoyID, convoy.Title)
-
-	// Send completion notification
-	notifyConvoyCompletion(townBeads, convoyID, convoy.Title)
-
-	return nil
+	_, err = closeConvoyIfComplete(townBeads, convoyID, convoy.Title, tracked, dryRun)
+	return err
 }
 
 func runConvoyClose(cmd *cobra.Command, args []string) error {
@@ -1673,41 +1675,13 @@ func checkAndCloseCompletedConvoys(townBeads string, dryRun bool) ([]struct{ ID,
 			style.PrintWarning("skipping convoy %s: %v", convoy.ID, err)
 			continue
 		}
-		// A convoy with 0 tracked issues is definitionally complete
-		// (tracking deps were likely lost). Close it.
-		allClosed := true
-		for _, t := range tracked {
-			if t.Status != "closed" && t.Status != "tombstone" {
-				allClosed = false
-				break
-			}
+		ready, err := closeConvoyIfComplete(townBeads, convoy.ID, convoy.Title, tracked, dryRun)
+		if err != nil {
+			style.PrintWarning("couldn't close convoy %s: %v", convoy.ID, err)
+			continue
 		}
-
-		if allClosed {
-			if dryRun {
-				// In dry-run mode, just record what would be closed
-				closed = append(closed, struct{ ID, Title string }{convoy.ID, convoy.Title})
-				continue
-			}
-
-			// Close the convoy
-			reason := "All tracked issues completed"
-			if len(tracked) == 0 {
-				reason = "Empty convoy (0 tracked issues) — auto-closed as definitionally complete"
-			}
-			closeArgs := []string{"close", convoy.ID, "-r", reason}
-			closeCmd := exec.Command("bd", closeArgs...)
-			closeCmd.Dir = townBeads
-
-			if err := closeCmd.Run(); err != nil {
-				style.PrintWarning("couldn't close convoy %s: %v", convoy.ID, err)
-				continue
-			}
-
+		if ready {
 			closed = append(closed, struct{ ID, Title string }{convoy.ID, convoy.Title})
-
-			// Check if convoy has notify address and send notification
-			notifyConvoyCompletion(townBeads, convoy.ID, convoy.Title)
 		}
 	}
 
