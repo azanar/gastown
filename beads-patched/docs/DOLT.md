@@ -1,0 +1,356 @@
+# Dolt Backend for Beads
+
+Beads uses Dolt as its storage backend. Dolt provides a version-controlled SQL database with cell-level merge, native branching, and two deployment modes.
+
+## Why Dolt?
+
+- **Native version control** — cell-level diffs and merges, not line-based
+- **Multi-writer support** — server mode enables concurrent agents
+- **Built-in history** — every write creates a Dolt commit
+- **Native branching** — Dolt branches independent of git branches
+- **Single-binary option** — embedded mode for solo users (no daemon needed)
+
+## Getting Started
+
+### New Project
+
+```bash
+# Embedded mode (single writer, no daemon — default for standalone)
+bd init
+
+# Server mode (multi-writer, e.g. Gas Town)
+gt dolt start           # Start the Dolt server
+bd init --server        # Initialize with server mode
+```
+
+### Migrate from SQLite (Legacy)
+
+If upgrading from an older version that used SQLite:
+
+> **Note:** The `bd migrate --to-dolt` command was removed in v0.58.0.
+> For pre-0.50 installations with JSONL data, use the migration script:
+>
+> ```bash
+> scripts/migrate-jsonl-to-dolt.sh
+> ```
+>
+> See [Troubleshooting](TROUBLESHOOTING.md#circuit-breaker-server-appears-down-failing-fast) if you encounter connection errors after migration.
+
+Migration creates backups automatically. Your original SQLite database is preserved as `beads.backup-pre-dolt-*.db`.
+
+## Modes of Operation
+
+### Embedded Mode (Solo / Standalone)
+
+In-process Dolt engine — no separate server needed. This is the default for
+standalone Beads users. The `bd` binary includes everything; just `bd init` and go.
+
+- Single-writer (one process at a time)
+- Data lives in `.beads/dolt/` alongside your code
+- Push to GitHub with `bd dolt push` — code and issues in one repo
+- Zero ops: no daemon, no ports, no PID files
+
+### Server Mode (Multi-Writer / Gas Town)
+
+Connects to a running `dolt sql-server` for multi-client access.
+
+```bash
+# Start the server (Gas Town)
+gt dolt start
+
+# Or manually
+cd ~/.dolt-data/beads && dolt sql-server --port 3307
+```
+
+```yaml
+# .beads/config.yaml
+dolt:
+  mode: server
+  host: 127.0.0.1
+  port: 3307
+  user: root
+```
+
+Server mode is required for:
+- Multiple agents writing simultaneously
+- Gas Town multi-rig setups
+- Federation with remote peers
+
+## Federation (Peer-to-Peer Sync)
+
+Federation enables direct sync between Dolt installations without a central hub.
+
+### Architecture
+
+```
+┌─────────────────┐         ┌─────────────────┐
+│   Gas Town A    │◄───────►│   Gas Town B    │
+│  dolt sql-server│  sync   │  dolt sql-server│
+│  :3306 (sql)    │         │  :3306 (sql)    │
+│  :8080 (remote) │         │  :8080 (remote) │
+└─────────────────┘         └─────────────────┘
+```
+
+In federation mode, the server exposes two ports:
+- **MySQL (3306)**: Multi-writer SQL access
+- **remotesapi (8080)**: Peer-to-peer push/pull
+
+### Quick Start
+
+```bash
+# Add a peer
+bd federation add-peer town-beta 192.168.1.100:8080/beads
+
+# With authentication
+bd federation add-peer town-beta host:8080/beads --user sync-bot
+
+# Sync with all peers
+bd federation sync
+
+# Handle conflicts
+bd federation sync --strategy theirs  # or 'ours'
+
+# Check status
+bd federation status
+```
+
+### Topologies
+
+| Pattern | Description | Use Case |
+|---------|-------------|----------|
+| Hub-spoke | Central hub, satellites sync to hub | Team with central coordination |
+| Mesh | All peers sync with each other | Decentralized collaboration |
+| Hierarchical | Tree of hubs | Multi-team organizations |
+
+### Credentials
+
+Peer credentials are AES-256 encrypted, stored locally, and used automatically during sync:
+
+```bash
+# Credentials prompted interactively
+bd federation add-peer name url --user admin
+
+# Stored in federation_peers table (encrypted)
+```
+
+### Troubleshooting
+
+```bash
+# Check federation health
+bd doctor --deep
+
+# Verify peer connectivity
+bd federation status
+```
+
+## Contributor Onboarding (Clone Bootstrap)
+
+When someone clones a repository that uses Dolt backend:
+
+1. On first `bd` command (e.g., `bd list`), bootstrap runs automatically
+2. A fresh Dolt database is created
+3. If a Dolt remote is configured, data is pulled from the remote
+4. Work continues normally
+
+**No manual steps required.** The bootstrap:
+- Detects fresh clone (no Dolt database yet)
+- Acquires a lock to prevent race conditions
+- Initializes the Dolt database and pulls from configured remotes
+- Creates initial Dolt commit
+
+### Verifying Bootstrap Worked
+
+```bash
+bd list              # Should show issues
+bd vc log            # Should show initial commit
+```
+
+## Troubleshooting
+
+### Server Not Running
+
+**Symptom:** Connection refused errors when using server mode.
+
+```
+failed to create database: dial tcp 127.0.0.1:3307: connect: connection refused
+```
+
+**Fix:**
+```bash
+gt dolt start        # Gas Town command
+# Or
+gt dolt status       # Check if running
+```
+
+### Bootstrap Not Running
+
+**Symptom:** `bd list` shows nothing on fresh clone.
+
+**Check:**
+```bash
+ls .beads/dolt/            # Should NOT exist (pre-bootstrap)
+BD_DEBUG=1 bd list         # See bootstrap output
+```
+
+**Force bootstrap:**
+```bash
+rm -rf .beads/dolt         # Remove broken state
+bd list                    # Re-triggers bootstrap
+```
+
+### Database Corruption
+
+**Symptom:** Queries fail, inconsistent data.
+
+**Diagnosis:**
+```bash
+bd doctor                  # Basic checks
+bd doctor --deep           # Full validation
+bd doctor --server         # Server mode checks (if applicable)
+```
+
+**Recovery options:**
+
+1. **Repair what's fixable:**
+   ```bash
+   bd doctor --fix
+   ```
+
+2. **Rebuild from remote:**
+   ```bash
+   rm -rf .beads/dolt
+   bd list                  # Re-triggers bootstrap
+   ```
+
+### Lock Contention (Embedded Mode)
+
+**Symptom:** "database is locked" errors.
+
+Embedded mode is single-writer. If you need concurrent access:
+
+```bash
+# Switch to server mode
+gt dolt start
+bd config set dolt.mode server
+```
+
+## Configuration Reference
+
+```yaml
+# .beads/config.yaml
+
+# Dolt settings
+dolt:
+  # Auto-commit Dolt history after writes (default: on for embedded, off for server)
+  auto-commit: on        # on | off
+
+  # Server mode settings (when mode: server)
+  mode: embedded         # embedded | server
+  host: 127.0.0.1
+  port: 3307
+  user: root
+  # Password via BEADS_DOLT_PASSWORD env var
+```
+
+### Environment Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `BEADS_DOLT_PASSWORD` | Server mode password |
+| `BEADS_DOLT_SERVER_MODE` | Enable server mode (set to "1") |
+| `BEADS_DOLT_SERVER_HOST` | Server host (default: 127.0.0.1) |
+| `BEADS_DOLT_SERVER_PORT` | Server port (default: 3307) |
+| `BEADS_DOLT_SERVER_TLS` | Enable TLS (set to "1" or "true") |
+| `BEADS_DOLT_SERVER_USER` | MySQL connection user |
+| `DOLT_REMOTE_USER` | Push/pull auth user |
+| `DOLT_REMOTE_PASSWORD` | Push/pull auth password |
+| `BD_DOLT_AUTO_COMMIT` | Override auto-commit setting |
+
+## Dolt Version Control
+
+Dolt maintains its own version history, separate from Git:
+
+```bash
+# View Dolt commit history
+bd vc log
+
+# Show diff between Dolt commits
+bd vc diff HEAD~1 HEAD
+
+# Create manual checkpoint
+bd vc commit -m "Checkpoint before refactor"
+```
+
+### Auto-Commit Behavior
+
+In **embedded mode** (standalone default), each `bd` write command creates a Dolt commit:
+
+```bash
+bd create "New issue"    # Creates issue + Dolt commit
+```
+
+In **server mode** (Gas Town), auto-commit defaults to OFF because the server
+manages its own transaction lifecycle. Firing `DOLT_COMMIT` after every write
+under concurrent load causes 'database is read only' errors.
+
+Override for batch operations (embedded) or explicit commits (server):
+
+```bash
+bd --dolt-auto-commit off create "Issue 1"
+bd --dolt-auto-commit off create "Issue 2"
+bd vc commit -m "Batch: created issues"
+```
+
+## Server Management (Gas Town)
+
+Gas Town provides integrated Dolt server management:
+
+```bash
+gt dolt start            # Start server (background)
+gt dolt stop             # Stop server
+gt dolt status           # Show server status
+gt dolt logs             # View server logs
+gt dolt sql              # Open SQL shell
+```
+
+Server runs on port 3307 (avoids MySQL conflict on 3306).
+
+### Data Location (Gas Town)
+
+```
+~/gt/.dolt-data/
+├── hq/                  # Town beads (hq-*)
+├── gastown/             # Gastown rig (gt-*)
+├── beads/               # Beads rig (bd-*)
+├── wyvern/              # Wyvern rig (wy-*)
+└── sky/                 # Sky rig (sky-*)
+```
+
+## Migration Cleanup
+
+After successful migration from SQLite, you may have backup files:
+
+```
+.beads/beads.backup-pre-dolt-20260122-213600.db
+.beads/sqlite.backup-pre-dolt-20260123-192812.db
+```
+
+These are safe to delete once you've verified Dolt is working:
+
+```bash
+# Verify Dolt works
+bd list
+bd doctor
+
+# Then clean up (after appropriate waiting period)
+rm .beads/*.backup-*.db
+```
+
+**Recommendation:** Keep backups for at least a week before deleting.
+
+## See Also
+
+- [CONFIG.md](CONFIG.md) - Full configuration reference
+- [DEPENDENCIES.md](DEPENDENCIES.md) - Dependencies and gates
+- [GIT_INTEGRATION.md](GIT_INTEGRATION.md) - Git worktrees and protected branches
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) - General troubleshooting
