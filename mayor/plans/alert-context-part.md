@@ -214,6 +214,19 @@ User clicks "Resolve" → alerts.resolve mutation → UPDATE alerts SET status='
                                                 → postSlackStatusUpdate()
 ```
 
+### Database Index for `findMessageWithAlertContext`
+
+`findMessageWithAlertContext` queries the `messages` table for a row whose JSONB `content` array contains an `alert_context` part with a matching `alertId`. Without an index, this is a full table scan — unacceptable at scale.
+
+Add a GIN index on `messages.content` to support this query:
+
+```sql
+CREATE INDEX idx_messages_content_alert_context
+  ON messages USING GIN (content jsonb_path_ops);
+```
+
+This index must land **before** the mutation changes ship. The checklist reflects this ordering.
+
 ### `updateAlertContextInThread`
 
 ```typescript
@@ -329,16 +342,64 @@ No data migration needed — old messages are immutable. The content part union 
 
 ## Implementation Checklist
 
+- [ ] Create `alert-context-part` feature flag in PostHog (required before any gated code ships)
 - [ ] `packages/threads/src/content-parts.ts` — add `alertContextPartSchema` to content part union, export `AlertContextPart` type
 - [ ] `packages/inngest/src/events/threads.ts` — mirror `alert_context` schema in local content part union
 - [ ] `packages/threads/src/thread-message-metadata.ts` — verify `alert_context` is excluded from thread previews (should be by default, but confirm)
+- [ ] Add database index for `findMessageWithAlertContext` — GIN index on `messages.content` for JSONB `alert_context.alertId` lookup (must land before mutations ship, otherwise `updateAlertContextInThread` scans the full messages table)
 - [ ] `services/agent/lib/thread-history.ts` — add `hydrateAlertContext` step in `loadThreadMessages`, gated on feature flag
 - [ ] `services/agent/lib/thread-history.ts` — add `alert_context` case in `toUiMessagePart` for model input conversion
 - [ ] `packages/tools/src/alerts/tools/trigger-alert.ts` — emit `alert_context` part alongside `alertCard` artifact, gated on feature flag
 - [ ] `services/durable-agent/src/workflows/chat/content-part-converter.ts` — handle `alert_context` extraction from tool results
 - [ ] `lambdas/api/src/routers/alerts.ts` — add `updateAlertContextInThread` call to `resolve`, `mute`, `unmute` mutations, gated on feature flag
 - [ ] Alert card UI component — accept `AlertContextPart` props, render from content part instead of `useQuery`, with fallback to legacy artifact behavior
-- [ ] Create `alert-context-part` feature flag in PostHog
+
+## Test Plan
+
+This change introduces a new content part type that crosses the thread model, agent history loader, mutation handlers, and UI rendering. Each boundary needs test coverage.
+
+### Unit Tests
+
+#### `hydrateAlertContext` (thread history loader)
+
+- **Hydrates alert_context parts with live state**: Pass message rows containing `alert_context` parts with stale status. Mock `fetchAlertsByIds` to return updated state. Assert the returned rows have patched `status`, `severity`, `resolvedAt`, `mutedAt` fields.
+- **No-op when no alert_context parts exist**: Pass message rows with only `text` and `tool_call` parts. Assert `fetchAlertsByIds` is not called. Assert rows returned unchanged.
+- **Handles deleted alerts gracefully**: Include an `alertId` whose alert no longer exists (not in fetch result). Assert the stale snapshot is preserved (not nulled or removed).
+- **Batch-fetches across multiple messages**: Create rows with `alert_context` parts spread across 3+ messages referencing different `alertId`s. Assert a single call to `fetchAlertsByIds` with all IDs.
+- **Respects feature flag**: When `alert-context-part` flag is off, hydration is skipped entirely. Assert rows pass through unmodified.
+
+#### `toUiMessagePart` (model input conversion)
+
+- **Converts alert_context to structured text**: Pass an `alert_context` part with all fields populated. Assert output is a `text` part with the expected formatted string.
+- **Omits optional fields when absent**: Pass an `alert_context` part without `whyItHappened`, `howToFix`, `resolvedAt`, `mutedAt`. Assert the text part omits those lines.
+
+#### `alertContextPartSchema` (schema validation)
+
+- **Accepts valid alert_context**: Full object with all required and optional fields.
+- **Rejects missing required fields**: Omit `alertId`, `name`, `severity`, `status`, `whatHappened`, `triggeredAt` individually. Each should fail validation.
+- **Rejects invalid enum values**: `severity: "unknown"`, `status: "snoozed"`.
+
+### Integration Tests
+
+#### Mutation → `alert_context` update path
+
+- **Resolve mutation updates alert_context in thread**: Create a thread message with an `alert_context` part (status: `"open"`). Call the `resolve` mutation. Assert the message's `alert_context` part now has `status: "resolved"` and a valid `resolvedAt` timestamp. Assert a `thread/message.updated` event was emitted.
+- **Mute mutation updates alert_context in thread**: Same pattern — mute, assert `status: "muted"`, `mutedAt` set.
+- **Unmute mutation clears muted state**: Mute then unmute. Assert `status: "open"`, `mutedAt` cleared.
+- **Mutation is no-op for pre-migration messages**: Call `resolve` on an alert that has only an `alertCard` artifact (no `alert_context` part). Assert no error, no thread content change.
+
+#### `trigger_alert` → content part emission
+
+- **Tool emits alert_context alongside artifact (flag on)**: Invoke `trigger_alert` with the feature flag enabled. Assert the tool result contains both an `alertCard` artifact and an `alert_context` content part with matching `alertId`.
+- **Tool emits only artifact (flag off)**: Invoke `trigger_alert` with the feature flag disabled. Assert only the `alertCard` artifact is emitted, no `alert_context` part.
+
+### UI Component Tests
+
+#### Alert card rendering
+
+- **Renders from alert_context part**: Pass an `AlertContextPart` as props. Assert the card renders status badge, severity, name, timestamps from the part fields. Assert no `useQuery` call is made.
+- **Falls back to legacy artifact behavior**: Pass only an `alertId` (no `alert_context` part available). Assert the card falls back to `trpc.alerts.get.useQuery` fetching. This covers old messages during migration.
+- **Re-renders on content part update**: Simulate a thread update event that patches the `alert_context` part's status from `"open"` to `"resolved"`. Assert the card re-renders with the new status without a full page refresh.
 
 ## Open Questions
 
