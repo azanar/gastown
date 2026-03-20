@@ -38,11 +38,17 @@ Add a `notification_preferences` database table and tRPC endpoints for managing 
 
 ## Key Design Decisions
 
-### Single table with optional projectId (not a separate project preferences table)
+### Channel activation is an intersection, not a precedence chain
 
-The existing `NotificationPreference` type has `userId` + `organizationId`. Add an optional `projectId` column. When `projectId` is null, the row represents a user-level default for the organization. When `projectId` is set, it's a project-level override.
+A channel is enabled for delivery **only when both gates are open**: the project has the channel enabled, AND the user has the channel enabled. If either says no, the channel is off — regardless of the other's setting.
 
-**Why single table?** The preference resolution logic is: project-level override > user-level default > system default. A single table with a nullable `projectId` keeps the query simple — one SELECT with ORDER BY projectId NULLS LAST, LIMIT 1.
+This means `resolveNotificationPreference` makes two lookups and ANDs them:
+1. **Project gate** — does this project allow this channel? Stored as a project-level row (`userId` null; applies to all members of the project).
+2. **User gate** — does this user want this channel? Stored as a user-level row (`userId` set, `projectId` null for org-wide default or set for a per-project user override).
+
+**Why intersection, not precedence?** Project-level flags represent what the project admin has enabled for that context (e.g., "Slack notifications are on for this project"). User flags represent personal opt-in ("I want Slack notifications"). Neither should silently override the other — a project enabling Slack doesn't force a user who opted out to receive it, and a user enabling Slack doesn't cause delivery to a project where Slack has been disabled.
+
+**Schema implication:** `userId` must be nullable to support project-level rows (no user). The `NULLS NOT DISTINCT` unique index handles null userId correctly.
 
 **Why not extend the existing notifications table?** Preferences are per-user configuration, not per-notification records. Separate concerns.
 
@@ -50,18 +56,24 @@ The existing `NotificationPreference` type has `userId` + `organizationId`. Add 
 
 A row with `notificationType: null` is the catch-all default for a channel. A row with a specific `notificationType` overrides the default for that type. This matches the existing `NotificationPreference` interface where `notificationType` is already nullable.
 
-### Precedence rules
+### Channel resolution: intersection of project gate and user gate
 
-Resolution order for "should notification type X be delivered on channel Y for user U in project P?":
+"Should notification type X be delivered on channel Y for user U in project P?" requires two independent lookups that must both return enabled:
 
-1. Project-level preference for this specific type + channel + user + project → use it
-2. Project-level default (null type) for this channel + user + project → use it
-3. User-level preference for this specific type + channel + user + org → use it
-4. User-level default (null type) for this channel + user + org → use it
-5. System default: in-app = enabled, Slack = enabled if workspace connected, email = disabled
+**Project gate** — is channel Y enabled for project P?
+```sql
+SELECT enabled FROM notification_preferences
+WHERE user_id IS NULL
+  AND organization_id = $orgId
+  AND project_id = $projectId
+  AND channel = $channel
+  AND (notification_type = $type OR notification_type IS NULL)
+ORDER BY notification_type NULLS LAST  -- type-specific before catch-all
+LIMIT 1;
+```
+If no row found: default = enabled (project hasn't explicitly disabled it).
 
-This can be expressed as a single query:
-
+**User gate** — does user U want channel Y?
 ```sql
 SELECT enabled FROM notification_preferences
 WHERE user_id = $userId
@@ -70,12 +82,13 @@ WHERE user_id = $userId
   AND (notification_type = $type OR notification_type IS NULL)
   AND (project_id = $projectId OR project_id IS NULL)
 ORDER BY
-  project_id NULLS LAST,           -- project-specific before user-default
+  project_id NULLS LAST,           -- per-project user preference before org-wide default
   notification_type NULLS LAST     -- type-specific before catch-all
 LIMIT 1;
 ```
+If no row found: system default (in-app = enabled, Slack = enabled if workspace connected, email = disabled).
 
-If no row found, fall back to system defaults.
+**Result:** `projectEnabled AND userEnabled`. Both must be true for the channel to fire.
 
 ## Database Schema
 
@@ -86,7 +99,7 @@ export const notificationPreferences = pgTable(
   "notification_preferences",
   {
     id: uuid("id").primaryKey(),
-    userId: text("user_id").notNull(),
+    userId: text("user_id"),  // null for project-level rows (no specific user)
     organizationId: text("organization_id").notNull(),
     projectId: uuid("project_id").references(() => projects.id, { onDelete: "cascade" }),
     channel: notificationChannel("channel").notNull(),
@@ -208,7 +221,7 @@ preferences: {
 }
 ```
 
-Returns the effective preference for a specific channel + type + optional project, walking the precedence chain. Useful for the delivery pipeline and for UI to show "effective" state.
+Returns the effective preference for a specific channel + type + optional project, applying the intersection model (project gate AND user gate). Useful for the delivery pipeline and for UI to show "effective" state.
 
 ## Preference Resolution Helper
 
@@ -245,8 +258,9 @@ This is used by both the tRPC `preferences.resolve` endpoint and by the `notific
 - [ ] `lambdas/api/src/routers/notifications.ts` — add `preferences.delete` endpoint
 - [ ] `lambdas/api/src/routers/notifications.ts` — add `preferences.resolve` endpoint (using shared `resolveNotificationPreference`)
 
-## Open Questions
+## Decisions
 
-- Should there be organization-level defaults (admin sets defaults for all users)? Defer — start with per-user preferences only.
-- Should deleting a project cascade-delete its notification preferences? Yes, using FK `onDelete: "cascade"`.
-- ~~Do we need a bulk upsert endpoint for the settings UI to save all preferences at once?~~ **Resolved: No.** The UI plan (`notification-preferences-ui.md`) specifies auto-save with immediate per-toggle upsert — each toggle calls `preferences.upsert` individually on click. A bulk endpoint is unnecessary: the matrix is at most ~30 cells (10 notification types × 3 channels), users change one preference at a time, and bulk upsert optimizes for a use case that doesn't exist in the UI. No `preferences.bulkUpsert` endpoint will be implemented.
+- **Organization-level defaults:** Deferred — start with per-user preferences only.
+- **Project cascade delete:** Yes, FK `onDelete: "cascade"` on `projectId`.
+- **Bulk upsert endpoint:** Not needed. UI uses auto-save per-toggle (individual upsert per click). See `notification-preferences-ui.md`.
+- **Channel activation model:** Intersection — project gate AND user gate must both be enabled. See "Channel resolution" above.

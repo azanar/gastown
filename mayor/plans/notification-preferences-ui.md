@@ -48,14 +48,12 @@ Member joined            [on]     [off]    [off]
 - **Rows**: One row per `NotificationType` value, plus a "All notifications" catch-all row at the top.
 - **Columns**: One column per `NotificationChannel` (`in_app`, `slack`, `email`).
 - **Cells**: Toggle switch. On = enabled, off = disabled.
-- **Catch-all row**: Maps to `notificationType: null` in the backend. When toggled, it sets the default for all types on that channel. Type-specific rows override the catch-all. See "Catch-all toggle behavior" below for cascade rules.
+- **Catch-all row**: Maps to `notificationType: null` in the backend. When toggled, it sets the default for all types on that channel. Type-specific rows override the catch-all.
 - **Inheritance indicator**: If a type-specific row has no explicit preference (inheriting from the catch-all), the toggle shows the catch-all's state with a dimmed/inherited visual treatment. Clicking it creates an explicit override.
 
 ### Section 2: Project Overrides
 
 A collapsible section below defaults. Initially collapsed with a summary line: "No project-specific overrides" or "2 projects with custom preferences".
-
-**Populating the summary count**: The `preferences.list` endpoint only returns preferences for a single `projectId` at a time — it cannot provide the count of projects with overrides. To populate the summary line, the UI calls a separate `preferences.listProjectsWithOverrides` endpoint (see API Contract below) that returns the list of project IDs (and names) that have at least one override row. This is a lightweight query (SELECT DISTINCT project_id) and is fetched once when the section renders.
 
 **Expanding** shows a project selector dropdown. Selecting a project reveals the same matrix as Section 1, but scoped to that project. Values that match the user-level default show as inherited (dimmed toggle). Toggling creates a project-level override row in the backend.
 
@@ -75,7 +73,7 @@ Slack workspace connection status is already queryable — the alert card plan a
 
 ## API Contract
 
-The UI consumes four tRPC endpoints from the backend preferences API:
+The UI consumes three tRPC endpoints from the backend preferences API:
 
 ### Reading preferences
 
@@ -91,7 +89,7 @@ const { data } = trpc.notifications.preferences.list.useQuery({
     id: string;
     channel: "in_app" | "slack" | "email";
     notificationType: NotificationType | null;  // null = catch-all
-    projectId: string | null;  // null = user-level default, string = project override
+    projectId: string | null;
     enabled: boolean;
   }>;
   defaults: {
@@ -101,8 +99,6 @@ const { data } = trpc.notifications.preferences.list.useQuery({
   };
 }
 ```
-
-**Backend plan cross-reference**: The `preferences.list` response shape in `notification-preferences-backend.md` currently omits `projectId` from the response array. The UI depends on `projectId` to distinguish user-level rows (`projectId: null`) from project-level override rows (`projectId: string`). The backend plan must be updated to include `projectId: string | null` in the response shape.
 
 ### Writing preferences
 
@@ -133,25 +129,6 @@ trpc.notifications.preferences.delete.useMutation({
 { preferenceId: string }
 ```
 
-### Listing projects with overrides
-
-```typescript
-// Fetch project IDs that have at least one override for this user
-const { data } = trpc.notifications.preferences.listProjectsWithOverrides.useQuery();
-
-// Response shape:
-{
-  projects: Array<{
-    projectId: string;
-    projectName: string;
-  }>;
-}
-```
-
-This powers the Section 2 summary line ("N projects with custom preferences") and the project selector dropdown. The backend implements this as `SELECT DISTINCT project_id FROM notification_preferences WHERE user_id = $userId AND organization_id = $orgId AND project_id IS NOT NULL`, joined to `projects` for the name.
-
-**Backend plan cross-reference**: This endpoint does not exist in `notification-preferences-backend.md` yet. It must be added there as `preferences.listProjectsWithOverrides`.
-
 ### Effective state resolution
 
 The UI computes effective state client-side using the same precedence rules as the backend:
@@ -172,26 +149,7 @@ Each toggle calls `preferences.upsert` immediately on click. The toggle flips op
 
 **Why auto-save?** Each toggle is an independent preference row in the database. There's no concept of "submit all preferences at once" — each row is independent. A Save button would either batch individual upserts (artificial batching) or require a new `bulkUpsert` endpoint (unnecessary complexity). Auto-save also matches the pattern users expect from notification settings (Gmail, Slack, GitHub all use immediate toggles).
 
-**Why not a bulk upsert?** The backend plan's open questions mention this possibility. It's not needed: the matrix is at most ~30 cells (10 notification types × 3 channels), and users change one preference at a time. A bulk endpoint optimizes for a use case that doesn't exist in the UI.
-
-### Catch-all toggle behavior when type-specific overrides exist
-
-When the user toggles the catch-all row (e.g., "All notifications" → Slack OFF), and type-specific overrides already exist for that channel, the behavior is:
-
-**The catch-all toggle does NOT cascade-delete type-specific overrides.** It only upserts the catch-all row (`notificationType: null`). Type-specific overrides remain and continue to take precedence over the catch-all per the resolution rules.
-
-**Why no cascade?** Cascade-deleting would silently destroy user configuration. If a user has explicitly enabled Slack for "Alert triggered" and then turns the catch-all OFF, they likely want most notifications off but alerts still on. Deleting the override would be surprising.
-
-**Visual feedback after toggling catch-all:**
-- Type-specific rows that have explicit overrides continue showing as "explicit" (solid toggle) — they are unaffected.
-- Type-specific rows with no override now inherit the new catch-all value. Their toggles update to show the new inherited state (dimmed).
-- A transient info banner appears: "Updated default for {channel}. {N} notification types have custom overrides that are unchanged." The banner auto-dismisses after 5 seconds.
-
-**Toggling catch-all ON when overrides exist that are OFF:**
-Same principle — no cascade. The type-specific OFF overrides remain. The banner says "{N} notification types remain disabled with custom overrides."
-
-**"Reset all to default" action:**
-The catch-all row has a secondary action (visible on hover or via "..." menu): "Reset all {channel} preferences." This deletes ALL type-specific overrides for that channel + scope (user-level or project-level), leaving only the catch-all. A confirmation dialog appears: "This will remove {N} custom overrides for {channel} notifications. All types will inherit the default setting." This is the only destructive cascade action, and it requires explicit confirmation.
+**Why not a bulk upsert?** Not needed: the matrix is at most ~30 cells (10 notification types × 3 channels), and users change one preference at a time. A bulk endpoint optimizes for a use case that doesn't exist in the UI.
 
 ### Client-side preference resolution (not per-cell API calls)
 
@@ -323,10 +281,8 @@ The "All notifications" catch-all row has a subtle background highlight (`bg-mut
 - [ ] `apps/dashboard/src/features/notifications/lib/resolve-preference.ts` — client-side preference resolution helper
 - [ ] `apps/dashboard/src/features/notifications/lib/notification-type-meta.ts` — display names and descriptions for each `NotificationType`
 
-## Open Questions
+## Decisions
 
-1. **Should admins be able to set org-wide defaults?** The backend plan defers org-level defaults. If added later, the UI would need an "Organization defaults" tab visible only to admins, with the same matrix layout. The component architecture (reusable `PreferencesMatrix`) supports this without restructuring.
-
-2. **Digest/batching preferences?** The delivery pipeline plan mentions batching as a future improvement. If added, the UI would need a "Delivery frequency" dropdown per channel (Immediate / Hourly digest / Daily digest). Not in scope for v1.
-
-3. **Per-severity alert filtering?** Deferred. The current toggle matrix covers enable/disable per notification type. A severity threshold within `alert_triggered` (e.g., "only critical and above") would replace the simple toggle with a dropdown for that specific row. Worth a follow-up plan if users request it.
+- **Org-wide admin defaults:** Deferred. `PreferencesMatrix` component architecture supports adding an "Organization defaults" admin tab later without restructuring.
+- **Digest/batching preferences:** Deferred. Would add a delivery frequency dropdown per channel if batching lands in the pipeline.
+- **Per-severity alert filtering:** Deferred. Would replace the `alert_triggered` toggle with a severity threshold dropdown if users request it.
