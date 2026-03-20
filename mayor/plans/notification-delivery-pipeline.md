@@ -60,13 +60,11 @@ The preference check uses `resolveNotificationPreference` from **`packages/notif
 
 The `check-preferences` step passes `projectId` from the event payload (if present). Channel activation requires **both gates open**: the project must have the channel enabled, AND the user must have the channel enabled. `resolveNotificationPreference` handles both lookups and returns the ANDed result.
 
-Until the notification preferences table exists (see companion bead for preferences backend), default behavior:
+Default behavior (when no preference row exists for a gate):
 - Slack: enabled if the organization has a connected Slack workspace with an alerts channel configured
-- Email: disabled by default (no user email preferences table yet)
+- Email: enabled (email: true)
 
-Once the preferences table exists, `resolveNotificationPreference` applies the intersection model. If no row is found for a gate, that gate defaults to enabled (project) or channel-specific system defaults (user).
-
-**Follow-on (hq-ehuwj, blocked on prefs backend hq-p43dn):** Once the preferences table ships, remove the hardcoded defaults from `notification-new` and let `resolveNotificationPreference` drive all decisions unconditionally.
+`resolveNotificationPreference` applies the intersection model. If no row is found for a gate, that gate defaults to enabled (project) or channel-specific system defaults (user).
 
 ### Delivery event payload schema
 
@@ -227,7 +225,7 @@ Two flags gate this system:
 - [ ] Create `notification-delivery` and `notification-delivery-email` flags in PostHog
 - [ ] `terraform/main/ssm-secrets.tf` — add `RESEND_API_KEY`, `RESEND_FROM_EMAIL`, and `CLERK_SECRET_KEY` to `lambda_inngest_secrets`
 - [ ] `lambdas/inngest/src/config.ts` — add `resend: { apiKey, fromEmail }` and `clerk: { secretKey }` to AppConfig
-- [ ] Default preference logic: Slack enabled when workspace connected, email disabled until preferences table exists
+- [x] Default preference logic: Slack enabled when workspace connected, email enabled by default (preferences table shipped in PR #3293)
 
 ## Decisions
 
