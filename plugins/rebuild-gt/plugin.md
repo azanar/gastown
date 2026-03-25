@@ -1,7 +1,7 @@
 +++
 name = "rebuild-gt"
 description = "Rebuild stale gt binary from gastown source"
-version = 2
+version = 3
 
 [gate]
 type = "cooldown"
@@ -39,18 +39,15 @@ gt stale --json
 ```
 
 Parse the JSON output and check these fields:
-- If `"stale": false` → record success wisp and exit early (binary is fresh)
-- If `"safe_to_rebuild": false` → **DO NOT REBUILD**. Record a skip wisp and exit.
+- If `"stale": false` → record a memory and exit early (binary is fresh)
+- If `"safe_to_rebuild": false` → **DO NOT REBUILD**. Record a skip memory and exit.
   This means the repo is on a non-main branch or HEAD is not a descendant of the
   binary commit (would be a downgrade).
 - If `"safe_to_rebuild": true` → proceed to build
 
-If `safe_to_rebuild` is false, record a skip wisp:
+If `safe_to_rebuild` is false, record a skip:
 ```bash
-bd create --wisp-type patrol \
-  --labels type:plugin-run,plugin:rebuild-gt,rig:gastown,result:skipped \
-  --description "Skipped: not safe to rebuild (forward=$FORWARD, main=$ON_MAIN)" \
-  "Plugin: rebuild-gt [skipped]"
+bd remember "plugin:rebuild-gt:last-run" "skipped: not safe to rebuild (forward=$FORWARD, main=$ON_MAIN) at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 ```
 
 ## Pre-flight Checks
@@ -63,7 +60,7 @@ git status --porcelain  # Must be clean
 git branch --show-current  # Must be "main"
 ```
 
-If either check fails, skip the rebuild and record a wisp.
+If either check fails, skip the rebuild and record a memory.
 
 ## Action
 
@@ -81,18 +78,12 @@ NOT restart the daemon — sessions will pick up the new binary on their next cy
 
 On success:
 ```bash
-bd create --wisp-type patrol \
-  --labels type:plugin-run,plugin:rebuild-gt,rig:gastown,result:success \
-  --description "Rebuilt gt: $OLD → $NEW ($N commits)" \
-  "Plugin: rebuild-gt [success]"
+bd remember "plugin:rebuild-gt:last-run" "success: rebuilt gt $OLD → $NEW ($N commits) at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 ```
 
 On failure:
 ```bash
-bd create --wisp-type patrol \
-  --labels type:plugin-run,plugin:rebuild-gt,rig:gastown,result:failure \
-  --description "Build failed: $ERROR" \
-  "Plugin: rebuild-gt [failure]"
+bd remember "plugin:rebuild-gt:last-run" "failure: $ERROR at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 gt escalate --severity=medium \
   --subject="Plugin FAILED: rebuild-gt" \
