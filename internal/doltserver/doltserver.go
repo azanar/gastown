@@ -2541,11 +2541,11 @@ func EnsureMetadata(townRoot, rigName string) error {
 	if existing["dolt_database"] == nil || existing["dolt_database"] == "" {
 		existing["dolt_database"] = rigName
 		changed = true
-	} else if dbStr, ok := existing["dolt_database"].(string); ok && dbStr != effectiveDB {
+	} else if dbStr, ok := existing["dolt_database"].(string); ok && dbStr != rigName {
 		// The database name is wrong — fix it. This is the primary repair path
 		// for identity mismatches caused by bd init writing the wrong database name.
-		fmt.Fprintf(os.Stderr, "Warning: metadata.json dolt_database was %q, correcting to %q (identity mismatch repair)\n", dbStr, effectiveDB)
-		existing["dolt_database"] = effectiveDB
+		fmt.Fprintf(os.Stderr, "Warning: metadata.json dolt_database was %q, correcting to %q (identity mismatch repair)\n", dbStr, rigName)
+		existing["dolt_database"] = rigName
 		changed = true
 	}
 	// dolt_server_port: JSON numbers unmarshal as float64, so compare accordingly.
