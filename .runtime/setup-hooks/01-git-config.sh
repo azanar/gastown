@@ -1,7 +1,10 @@
 #!/bin/bash
-# Set git identity in polecat worktrees so commits are attributed to Ed on GitHub.
-# Without this, commits fall back to system/global defaults which may vary.
+# Propagate global git identity into polecat worktrees.
+# Without this, commits may fall back to system defaults and be misattributed.
 set -euo pipefail
 
-git -C "$GT_WORKTREE_PATH" config user.name "Ed Carrel"
-git -C "$GT_WORKTREE_PATH" config user.email "ed@sazabi.ai"
+name=$(git config --global user.name 2>/dev/null || true)
+email=$(git config --global user.email 2>/dev/null || true)
+
+[ -n "$name" ]  && git -C "$GT_WORKTREE_PATH" config user.name  "$name"
+[ -n "$email" ] && git -C "$GT_WORKTREE_PATH" config user.email "$email"
