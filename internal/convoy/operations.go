@@ -198,7 +198,7 @@ var blockingDepTypes = map[string]bool{
 // by querying the appropriate rig store for fresh status. Without a resolver,
 // this falls back to the hq store's dependency metadata snapshot, which may
 // be stale for cross-rig issues (see GH #2624).
-func isIssueBlocked(ctx context.Context, store beadsdk.Storage, issueID string, resolver *StoreResolver) bool {
+func isIssueBlocked(ctx context.Context, store beadsdk.Storage, issueID string, resolver *StoreResolver, onResolved ...func(blockerID, issueID string)) bool {
 	if store == nil {
 		return false // fail-open: no store means we can't check deps
 	}
@@ -252,6 +252,7 @@ func isIssueBlocked(ctx context.Context, store beadsdk.Storage, issueID string, 
 	// Verify stale candidates via cross-store resolution
 	if len(staleCandidateIDs) > 0 {
 		freshMap := resolver.ResolveIssues(ctx, staleCandidateIDs)
+		notify := len(onResolved) > 0 && onResolved[0] != nil
 		for i, id := range staleCandidateIDs {
 			fresh, ok := freshMap[id]
 			if !ok {
@@ -259,6 +260,9 @@ func isIssueBlocked(ctx context.Context, store beadsdk.Storage, issueID string, 
 			}
 			freshStatus := string(fresh.Status)
 			if freshStatus == "tombstone" {
+				if notify {
+					onResolved[0](id, issueID)
+				}
 				continue
 			}
 			if freshStatus != "closed" {
@@ -268,10 +272,44 @@ func isIssueBlocked(ctx context.Context, store beadsdk.Storage, issueID string, 
 			if staleCandidateTypes[i] == "merge-blocks" && !strings.HasPrefix(fresh.CloseReason, "Merged in ") {
 				return true
 			}
+			// Cross-rig dep resolved: notify if callback provided
+			if notify {
+				onResolved[0](id, issueID)
+			}
 		}
 	}
 
 	return false
+}
+
+// notifyCrossRigResolution sends a notification to a rig's witness when a cross-rig
+// dependency resolves, unblocking an issue in that rig.
+func notifyCrossRigResolution(ctx context.Context, store beadsdk.Storage, townRoot, gtPath, blockerID, issueID, caller string, logger func(format string, args ...interface{})) {
+	rig := rigForIssue(townRoot, issueID)
+	if rig == "" {
+		return
+	}
+	witness := rig + "/witness"
+
+	var issueTitle string
+	if iss, err := store.GetIssue(ctx, issueID); err == nil && iss != nil {
+		issueTitle = iss.Title
+	}
+
+	subject := "Dependency resolved: " + blockerID
+	body := fmt.Sprintf("External dependency %s has closed.\nUnblocked: %s", blockerID, issueID)
+	if issueTitle != "" {
+		body += fmt.Sprintf(" (%s)", issueTitle)
+	}
+	body += "\nThis issue may now proceed."
+
+	mailCmd := exec.Command(gtPath, "mail", "send", witness, "-s", subject, "-m", body)
+	mailCmd.Dir = townRoot
+	if err := mailCmd.Run(); err != nil {
+		if logger != nil {
+			logger("%s: could not notify %s of dep resolution: %v", caller, witness, err)
+		}
+	}
 }
 
 // feedNextReadyIssue finds the next ready issue in a convoy and dispatches it
@@ -321,7 +359,11 @@ func feedNextReadyIssue(ctx context.Context, store beadsdk.Storage, townRoot, co
 		// Check blocking dependencies: blocks and conditional-blocks with
 		// non-closed targets prevent dispatch. parent-child is NOT treated
 		// as blocking (consistent with molecule step behavior).
-		if isIssueBlocked(ctx, store, issue.ID, resolver) {
+		// When cross-rig deps resolve, notify the rig's witness.
+		notifyResolved := func(blockerID, issueID string) {
+			notifyCrossRigResolution(ctx, store, townRoot, gtPath, blockerID, issueID, caller, logger)
+		}
+		if isIssueBlocked(ctx, store, issue.ID, resolver, notifyResolved) {
 			logger("%s: convoy %s: %s is blocked, skipping", caller, convoyID, issue.ID)
 			continue
 		}
