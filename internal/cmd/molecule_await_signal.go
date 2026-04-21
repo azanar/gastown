@@ -87,10 +87,11 @@ var moleculeAwaitSignalShortcutCmd = &cobra.Command{
 
 // AwaitSignalResult is the result of an await-signal operation.
 type AwaitSignalResult struct {
-	Reason     string        `json:"reason"`               // "signal" or "timeout"
-	Elapsed    time.Duration `json:"elapsed"`              // how long we waited
-	Signal     string        `json:"signal,omitempty"`     // the line that woke us (if signal)
+	Reason     string        `json:"reason"`                // "signal" or "timeout"
+	Elapsed    time.Duration `json:"elapsed"`               // how long we waited
+	Signal     string        `json:"signal,omitempty"`      // the line that woke us (if signal)
 	IdleCycles int           `json:"idle_cycles,omitempty"` // current idle cycle count (after update)
+	Effort     string        `json:"effort,omitempty"`      // "full" or "reduced" — patrol effort directive for next cycle
 }
 
 func init() {
@@ -265,6 +266,14 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 		_ = clearAgentBackoffUntil(awaitSignalAgentBead, beadsDir)
 	}
 
+	// Set effort directive: signal means activity occurred (full patrol needed),
+	// timeout means the town was idle (abbreviated patrol is sufficient).
+	if result.Reason == "signal" {
+		result.Effort = "full"
+	} else {
+		result.Effort = "reduced"
+	}
+
 	// Output result
 	if moleculeJSON {
 		enc := json.NewEncoder(os.Stdout)
@@ -295,6 +304,10 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 			}
 		}
 	}
+
+	// Always print EFFORT directive — functional output for patrol routing,
+	// not suppressed by --quiet (callers need this to route next cycle).
+	fmt.Printf("EFFORT: %s\n", strings.ToUpper(result.Effort))
 
 	return nil
 }

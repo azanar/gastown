@@ -35,7 +35,7 @@ No WITNESS_PING mail is sent. Witnesses observe the Deacon's last_activity
 timestamp instead, and only send an alert to the Mayor if the Deacon appears
 unresponsive (>5 minutes stale). This avoids heartbeat mail spam."""
 formula = "mol-deacon-patrol"
-version = 13
+version = 14
 
 [vars]
 [vars.wisp_type]
@@ -1121,11 +1121,17 @@ End of patrol cycle decision.
 
 **If context LOW** (can continue patrolling):
 
+Refresh the heartbeat again immediately before the long idle wait:
+
+```bash
+gt deacon heartbeat "pre-await checkpoint"
+```
+
 Use await-signal with exponential backoff to wait for activity:
 
 ```bash
 gt mol step await-signal --agent-bead hq-deacon \
-  --backoff-base 60s --backoff-mult 2 --backoff-max 5m
+  --backoff-base 60s --backoff-mult 2 --backoff-max 15m
 ```
 
 This command:
@@ -1135,8 +1141,9 @@ This command:
    - First timeout: 60s
    - Second timeout: 120s
    - Third timeout: 240s
-   - ...capped at 5 minutes max (PATCH-002: reduced from 10m for faster recovery)
+   - ...capped at 15 minutes max
 4. Tracks `idle:N` label on hq-deacon bead for backoff state
+5. Outputs `EFFORT: reduced` or `EFFORT: full` directive for next cycle
 
 **On signal received** (activity detected):
 Reset the idle counter and start next patrol cycle:
@@ -1147,6 +1154,26 @@ gt agent state hq-deacon --set idle=0
 **On timeout** (no activity):
 The idle counter was auto-incremented. Continue to next patrol cycle
 (the longer backoff will apply next time).
+
+## Effort-Based Patrol Routing
+
+After await-signal returns, check the EFFORT directive in the output:
+
+**If `EFFORT: FULL`** — Run all steps thoroughly (normal patrol).
+
+**If `EFFORT: REDUCED`** — Run ABBREVIATED patrol:
+- heartbeat: ALWAYS run
+- inbox-check: Quick drain only, skip individual messages unless HELP/RECOVERED_BEAD
+- orphan-process-cleanup through fire-notifications: SKIP all
+- heartbeat-mid: SKIP
+- health-scan: Quick status checks only, skip nudges
+- dolt-health through session-gc: SKIP all
+- wisp-compact through log-maintenance: SKIP all
+- patrol-cleanup: Quick inbox check only
+- context-check: One-sentence self-assessment
+
+Abbreviated patrol should complete in ~10% of the tokens of a full patrol.
+Mark skipped steps as SKIP in the patrol report.
 
 After await-signal returns (either by signal or timeout):
 1. Generate a brief summary of this patrol cycle's observations
