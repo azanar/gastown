@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/deacon"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
@@ -359,6 +361,32 @@ This helps the Deacon understand which convoys have been recently fed.`,
 	RunE: runDeaconFeedStrandedState,
 }
 
+var deaconCleanupTestPollutionCmd = &cobra.Command{
+	Use:   "cleanup-test-pollution",
+	Short: "Clean up runtime test pollution (stale dirs, PID files, dead dog worktrees)",
+	Long: `Detect and clean runtime pollution left by tests and dead processes.
+
+Cleans four categories of pollution. Only removes resources where the owning
+process is confirmed dead — never removes resources owned by live processes.
+
+  1. Rogue dolt servers   — kill imposters on the configured port
+  2. Stale test temp dirs — beads-test-dolt-* and beads-bd-tests-* in TMPDIR
+  3. Stale PID/lock files — dolt-test-server-*.pid and beads-test-dolt-*.pid in /tmp
+  4. Dead dog worktrees   — worktree dirs left by dogs whose tmux session is dead
+
+Reports counts for the patrol digest.
+
+Safety:
+  - Never kills this workspace's own legitimate dolt server
+  - Never removes dirs where lsof shows active file handles
+  - Never removes PID files where the PID is still alive
+  - Never prunes worktrees for dogs with live tmux sessions
+
+Example:
+  gt deacon cleanup-test-pollution`,
+	RunE: runDeaconCleanupTestPollution,
+}
+
 var (
 	// Status flags
 	deaconStatusJSON bool
@@ -412,6 +440,7 @@ func init() {
 	deaconCmd.AddCommand(deaconRedispatchStateCmd)
 	deaconCmd.AddCommand(deaconFeedStrandedCmd)
 	deaconCmd.AddCommand(deaconFeedStrandedStateCmd)
+	deaconCmd.AddCommand(deaconCleanupTestPollutionCmd)
 
 	// Flags for status
 	deaconStatusCmd.Flags().BoolVar(&deaconStatusJSON, "json", false, "Output as JSON")
@@ -1592,6 +1621,190 @@ func runDeaconFeedStranded(cmd *cobra.Command, args []string) error {
 		style.Bold.Render("●"), result.Fed, result.Closed, result.NeedsAttention, result.Skipped, result.Errors)
 
 	return nil
+}
+
+// runDeaconCleanupTestPollution detects and cleans runtime pollution from tests and dead processes.
+func runDeaconCleanupTestPollution(cmd *cobra.Command, args []string) error {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	var rogueDolt, staleDirs, stalePIDs, deadWorktrees int
+
+	// 1. Kill rogue dolt servers (imposters on the configured port with a different data-dir)
+	cfg := doltserver.DefaultConfig(townRoot)
+	if !cfg.IsRemote() {
+		conflictPID, conflictDir := doltserver.CheckPortConflict(townRoot)
+		if conflictPID != 0 {
+			fmt.Printf("  Found imposter dolt server (PID %d, data-dir: %s)\n", conflictPID, conflictDir)
+			if killErr := doltserver.KillImposters(townRoot); killErr != nil {
+				style.PrintWarning("kill-imposters: %v", killErr)
+			} else {
+				fmt.Printf("  %s Killed imposter dolt server (PID %d)\n", style.Bold.Render("✓"), conflictPID)
+				rogueDolt++
+			}
+		}
+	}
+
+	// 2. Clean stale test temp dirs (beads-test-dolt-* and beads-bd-tests-* in TMPDIR)
+	tmpDir := os.Getenv("TMPDIR")
+	if tmpDir == "" {
+		tmpDir = "/tmp"
+	}
+	for _, pattern := range []string{
+		filepath.Join(tmpDir, "beads-test-dolt-*"),
+		filepath.Join(tmpDir, "beads-bd-tests-*"),
+	} {
+		matches, _ := filepath.Glob(pattern)
+		for _, dir := range matches {
+			info, statErr := os.Stat(dir)
+			if statErr != nil || !info.IsDir() {
+				continue
+			}
+			if testPollutionDirInUse(dir) {
+				continue
+			}
+			// chmod u+w recursively so RemoveAll can delete read-only files
+			_ = filepath.Walk(dir, func(p string, fi os.FileInfo, walkErr error) error {
+				if walkErr != nil {
+					return nil
+				}
+				if fi.Mode()&0200 == 0 {
+					_ = os.Chmod(p, fi.Mode()|0200)
+				}
+				return nil
+			})
+			if removeErr := os.RemoveAll(dir); removeErr == nil {
+				fmt.Printf("  %s Removed stale test dir: %s\n", style.Bold.Render("✓"), filepath.Base(dir))
+				staleDirs++
+			} else {
+				style.PrintWarning("failed to remove %s: %v", filepath.Base(dir), removeErr)
+			}
+		}
+	}
+
+	// 3. Clean stale PID/lock files (dolt-test-server-*.pid and beads-test-dolt-*.pid in /tmp)
+	for _, pattern := range []string{
+		"/tmp/dolt-test-server-*.pid",
+		"/tmp/beads-test-dolt-*.pid",
+	} {
+		matches, _ := filepath.Glob(pattern)
+		for _, pidfile := range matches {
+			data, readErr := os.ReadFile(pidfile)
+			if readErr != nil {
+				continue
+			}
+			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
+			if parseErr != nil || pid <= 0 {
+				continue
+			}
+			if isProcessRunning(pid) {
+				continue // process still alive — leave the PID file
+			}
+			if removeErr := os.Remove(pidfile); removeErr == nil {
+				fmt.Printf("  %s Removed stale PID file: %s (PID %d dead)\n",
+					style.Bold.Render("✓"), filepath.Base(pidfile), pid)
+				stalePIDs++
+			}
+		}
+	}
+
+	// 4. Dead dog worktrees — prune worktree dirs left by dogs with dead tmux sessions
+	dogsDir := filepath.Join(townRoot, "deacon", "dogs")
+	dogEntries, readErr := os.ReadDir(dogsDir)
+	if readErr == nil {
+		for _, dogEntry := range dogEntries {
+			if !dogEntry.IsDir() {
+				continue
+			}
+			dogName := dogEntry.Name()
+			sessionName := "dog-" + dogName
+			if testPollutionTmuxSessionExists(sessionName) {
+				continue // dog session alive — skip
+			}
+			// Dog session is dead — check for leftover git worktree dirs
+			dogDir := filepath.Join(dogsDir, dogName)
+			rigEntries, err := os.ReadDir(dogDir)
+			if err != nil {
+				continue
+			}
+			for _, rigEntry := range rigEntries {
+				if !rigEntry.IsDir() {
+					continue
+				}
+				rigrepo := filepath.Join(dogDir, rigEntry.Name())
+				// Confirm it's a git worktree (has a .git file or dir)
+				if _, statErr := os.Stat(filepath.Join(rigrepo, ".git")); os.IsNotExist(statErr) {
+					continue
+				}
+				// Find the common git dir (bare repo) so we can run git worktree remove
+				commonDir, dirErr := testPollutionGetGitCommonDir(rigrepo)
+				if dirErr != nil || commonDir == "" {
+					style.PrintWarning("could not determine common dir for %s: %v", rigrepo, dirErr)
+					continue
+				}
+				rmCmd := exec.Command("git", "-C", commonDir, "worktree", "remove", "--force", rigrepo)
+				if runErr := rmCmd.Run(); runErr == nil {
+					fmt.Printf("  %s Pruned dead dog worktree: %s/%s\n",
+						style.Bold.Render("✓"), dogName, rigEntry.Name())
+					deadWorktrees++
+				} else {
+					style.PrintWarning("failed to prune worktree %s/%s: %v", dogName, rigEntry.Name(), runErr)
+				}
+			}
+		}
+	}
+
+	// 5. Report
+	if rogueDolt+staleDirs+stalePIDs+deadWorktrees == 0 {
+		fmt.Printf("%s Test pollution cleanup: clean\n", style.Success.Render("✓"))
+	} else {
+		fmt.Printf("%s Test pollution cleanup: rogue_dolt=%d stale_dirs=%d stale_pids=%d dead_worktrees=%d\n",
+			style.Bold.Render("✓"), rogueDolt, staleDirs, stalePIDs, deadWorktrees)
+	}
+
+	return nil
+}
+
+// testPollutionDirInUse checks if any process has files open in the given directory.
+// Uses lsof. Returns true (in use) if lsof finds open handles or if lsof is unavailable.
+func testPollutionDirInUse(dir string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	lsofCmd := exec.CommandContext(ctx, "lsof", "+D", dir)
+	err := lsofCmd.Run()
+	if err == nil {
+		return true // exit 0 = files are open
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return false // non-zero exit = no open files
+	}
+	return true // lsof unavailable or other error — be conservative
+}
+
+// testPollutionTmuxSessionExists checks if a tmux session with the given name exists.
+func testPollutionTmuxSessionExists(name string) bool {
+	tmuxCmd := exec.Command("tmux", "has-session", "-t", "="+name)
+	return tmuxCmd.Run() == nil
+}
+
+// testPollutionGetGitCommonDir returns the common git directory (bare repo path) for a worktree.
+func testPollutionGetGitCommonDir(worktreePath string) (string, error) {
+	gitCmd := exec.Command("git", "-C", worktreePath, "rev-parse", "--git-common-dir")
+	out, err := gitCmd.Output()
+	if err != nil {
+		return "", err
+	}
+	result := strings.TrimSpace(string(out))
+	if result == "" {
+		return "", nil
+	}
+	if !filepath.IsAbs(result) {
+		result = filepath.Join(worktreePath, result)
+	}
+	return result, nil
 }
 
 // runDeaconFeedStrandedState shows the current feed-stranded state.
