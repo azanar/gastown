@@ -359,6 +359,32 @@ This helps the Deacon understand which convoys have been recently fed.`,
 	RunE: runDeaconFeedStrandedState,
 }
 
+var deaconTestPollutionCleanupCmd = &cobra.Command{
+	Use:   "test-pollution-cleanup",
+	Short: "Detect and clean runtime test pollution",
+	Long: `Detect and clean runtime pollution left by tests and dead processes.
+
+Cleans four categories of pollution (only where the owning process is confirmed dead):
+
+  1. Rogue dolt servers - dolt sql-server processes on the configured port
+     that use a different data directory (imposters from another workspace).
+
+  2. Stale test temp dirs - beads-test-dolt-* and beads-bd-tests-* in TMPDIR
+     that have no active file handles (checked via lsof).
+
+  3. Stale PID/lock files - /tmp/dolt-test-server-*.pid and
+     /tmp/beads-test-dolt-*.pid where the recorded PID is dead.
+
+  4. Dead dog worktrees - worktree directories left behind by dogs whose
+     tmux sessions no longer exist.
+
+Reports counts of cleaned items. Safe to run while the workspace is live.
+
+Example:
+  gt deacon test-pollution-cleanup`,
+	RunE: runDeaconTestPollutionCleanup,
+}
+
 var (
 	// Status flags
 	deaconStatusJSON bool
@@ -412,6 +438,7 @@ func init() {
 	deaconCmd.AddCommand(deaconRedispatchStateCmd)
 	deaconCmd.AddCommand(deaconFeedStrandedCmd)
 	deaconCmd.AddCommand(deaconFeedStrandedStateCmd)
+	deaconCmd.AddCommand(deaconTestPollutionCleanupCmd)
 
 	// Flags for status
 	deaconStatusCmd.Flags().BoolVar(&deaconStatusJSON, "json", false, "Output as JSON")
@@ -1591,6 +1618,24 @@ func runDeaconFeedStranded(cmd *cobra.Command, args []string) error {
 	fmt.Printf("\n%s Fed: %d, Closed: %d, Needs attention: %d, Skipped: %d, Errors: %d\n",
 		style.Bold.Render("●"), result.Fed, result.Closed, result.NeedsAttention, result.Skipped, result.Errors)
 
+	return nil
+}
+
+// runDeaconTestPollutionCleanup cleans runtime test pollution.
+func runDeaconTestPollutionCleanup(cmd *cobra.Command, args []string) error {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	result := util.CleanTestPollution(townRoot)
+
+	// Report non-fatal errors as warnings.
+	for _, e := range result.Errors {
+		style.PrintWarning("%s", e)
+	}
+
+	fmt.Println(result.String())
 	return nil
 }
 
