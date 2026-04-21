@@ -332,12 +332,14 @@ func runSynthesisClose(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("reading convoy '%s': %w", convoyID, err)
 	}
 	var convoys []struct {
+		Title  string `json:"title"`
 		Status string `json:"status"`
 	}
 	if err := json.Unmarshal(showOut.Bytes(), &convoys); err != nil || len(convoys) == 0 {
 		return fmt.Errorf("parsing convoy '%s': invalid response", convoyID)
 	}
 	status := convoys[0].Status
+	title := convoys[0].Title
 
 	if err := ensureKnownConvoyStatus(status); err != nil {
 		return fmt.Errorf("convoy '%s' has invalid lifecycle state: %w", convoyID, err)
@@ -364,8 +366,8 @@ func runSynthesisClose(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("%s Convoy closed: %s\n", style.Bold.Render("✓"), convoyID)
 
-	// TODO: Trigger notification if configured
-	// Parse description for "Notify: <address>" and send mail
+	// Fire completion notifications to convoy owner and any notify addresses.
+	notifyConvoyCompletion(townBeads, convoyID, title)
 
 	return nil
 }

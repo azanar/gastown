@@ -175,16 +175,58 @@ func InjectFlatForListJSON(args []string) []string {
 	return args
 }
 
-// BdSupportsAllowStale returns false — --allow-stale is no longer used.
-// Retained for API compatibility with callers that haven't been updated.
+// bdAllowStale* caches whether the bd binary supports --allow-stale.
+// The cache is keyed on the resolved bd binary path so it auto-invalidates
+// when the binary changes (e.g., during tests that swap in stubs).
+var (
+	bdAllowStaleMu     sync.Mutex
+	bdAllowStalePath   string
+	bdAllowStaleResult bool
+)
+
+// BdSupportsAllowStale reports whether the bd binary on PATH accepts the
+// --allow-stale global flag. The result is cached per binary path: if the
+// resolved path changes (e.g., a test installs a stub) the binary is
+// re-probed automatically.
 func BdSupportsAllowStale() bool {
-	return false
+	bdPath, err := exec.LookPath("bd")
+	if err != nil {
+		return false
+	}
+
+	bdAllowStaleMu.Lock()
+	defer bdAllowStaleMu.Unlock()
+
+	if bdAllowStalePath == bdPath {
+		return bdAllowStaleResult
+	}
+
+	// Path changed — re-probe.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err = exec.CommandContext(ctx, bdPath, "--allow-stale").Run()
+	bdAllowStalePath = bdPath
+	bdAllowStaleResult = err == nil
+	return bdAllowStaleResult
 }
 
-// MaybePrependAllowStale returns args unchanged — --allow-stale is no longer used.
-// Retained for API compatibility with callers that haven't been updated.
+// MaybePrependAllowStale prepends --allow-stale to args when the bd binary
+// supports the flag, enabling staleness-tolerant reads.
 func MaybePrependAllowStale(args []string) []string {
+	if BdSupportsAllowStale() {
+		return append([]string{"--allow-stale"}, args...)
+	}
 	return args
+}
+
+// ResetBdAllowStaleCacheForTest clears the cached --allow-stale probe result.
+// Call this at the start of tests that swap out the bd binary on PATH so the
+// next BdSupportsAllowStale call re-probes the new binary.
+func ResetBdAllowStaleCacheForTest() {
+	bdAllowStaleMu.Lock()
+	defer bdAllowStaleMu.Unlock()
+	bdAllowStalePath = ""
+	bdAllowStaleResult = false
 }
 
 // IssueDep represents a dependency or dependent issue with its relation.
@@ -207,6 +249,7 @@ type ListOptions struct {
 	Assignee   string // filter by assignee (e.g., "gastown/Toast")
 	NoAssignee bool   // filter for issues with no assignee
 	Limit      int    // Max results (0 = unlimited, overrides bd default of 50)
+	Ephemeral  bool   // Filter for ephemeral (wisp) issues only
 }
 
 // CreateOptions specifies options for creating an issue.
